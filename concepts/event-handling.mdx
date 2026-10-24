@@ -1,5 +1,5 @@
 ---
-title: "GitHub Webhook Event Handling in probot-go"
+title: "GitHub Webhook Event Handling and Routing in probot-go"
 sidebarTitle: "Event Handling"
 description: "Learn how to subscribe to GitHub webhook events using On, OnMany, OnAny, and OnError in probot-go, and how to prevent bot feedback loops."
 ---
@@ -228,6 +228,12 @@ func (p *Probot) Receive(event WebhookEvent) error
 ```
 
 ```go
+import (
+    "testing"
+
+    probot "github.com/Pratyay360/probot-go"
+)
+
 func TestIssueOpenedHandler(t *testing.T) {
     app, _ := probot.New(probot.Options{GithubToken: "test-token"})
 

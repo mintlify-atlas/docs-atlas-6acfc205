@@ -1,7 +1,7 @@
 ---
 title: "The probot-go Context Object: Helpers and GitHub Client"
 sidebarTitle: "Context"
-description: "The Context object is passed to every probot-go handler. It provides a pre-authenticated GitHub client, structured logging, and helpers for extracting repo, issue, and PR data."
+description: "The probot-go Context provides a pre-authenticated GitHub client, a zerolog logger, and repo/issue/PR helpers to every webhook event handler."
 ---
 
 Every handler function in probot-go receives a single `*Context` argument. It wraps the raw GitHub webhook delivery — the event name, delivery ID, and parsed JSON payload — and bundles everything a handler typically needs: an authenticated GitHub API client scoped to the triggering installation, a zerolog logger pre-tagged with the event and delivery ID, and a set of convenience helpers so you rarely have to dig into the raw payload map yourself.

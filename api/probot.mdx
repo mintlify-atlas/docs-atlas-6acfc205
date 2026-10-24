@@ -1,7 +1,7 @@
 ---
-title: "Probot Type: Core Framework Methods Reference"
+title: "Probot Reference: Constructor, Events, and Handlers"
 sidebarTitle: "Probot"
-description: "Complete reference for the Probot type in probot-go: New constructor, event registration methods On/OnMany/OnAny, Auth, Receive, RunAction, and HTTP handler methods."
+description: "Full API reference for the Probot type: New constructor, On/OnMany/OnAny event registration, Auth, Receive, RunAction, and HTTP handlers."
 ---
 
 The `Probot` struct is the central object in probot-go. It owns the webhook event pipeline, manages GitHub App and installation-level authentication, exposes HTTP handlers you can mount in any `net/http` server, and provides the `RunAction` entry-point for running directly as a GitHub Action. All exported methods are safe for concurrent use.

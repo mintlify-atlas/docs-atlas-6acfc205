@@ -1,5 +1,5 @@
 ---
-title: "Run probot-go as a Standalone HTTP Server"
+title: "Serve Your probot-go App with the Built-In HTTP Server"
 sidebarTitle: "Server Setup"
 description: "Learn how to use NewServer to run your probot-go app, use the setup wizard for one-click app registration, and forward webhooks locally with Smee.io."
 ---
@@ -65,9 +65,9 @@ server := probot.NewServer(probot.ServerOptions{Probot: app})
 
 ## Routes Mounted by Handler()
 
-The mux returned by `Handler()` registers three routes:
+The mux returned by `Handler()` registers four routes:
 
-<CardGroup cols={3}>
+<CardGroup cols={2}>
   <Card title="Webhook path" icon="webhook">
     Defaults to `/api/github/webhooks`. All `POST` requests from GitHub land here; the handler verifies the `X-Hub-Signature-256` header before dispatching.
   </Card>
@@ -76,6 +76,9 @@ The mux returned by `Handler()` registers three routes:
   </Card>
   <Card title="/setup/callback" icon="key">
     Receives the one-time `code` from GitHub's manifest flow and exchanges it for app credentials.
+  </Card>
+  <Card title="&lt;webhookPath&gt;/setup/callback" icon="key">
+    An additional alias for the setup callback, mounted under the webhook path prefix (e.g. `/api/github/webhooks/setup/callback`). Registered when the webhook path is not `/`.
   </Card>
 </CardGroup>
 
@@ -120,7 +123,7 @@ The setup wizard at `/` eliminates the need to manually create a GitHub App thro
   <Step title="Credentials written automatically">
     After creation GitHub redirects to `/setup/callback` with a one-time code. The server exchanges it for the app's ID, private key, and webhook secret, then writes them to the `.env` file (default: `.env` in the working directory):
 
-    ```
+    ```bash
     APP_ID=123456
     WEBHOOK_SECRET=<generated>
     PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."

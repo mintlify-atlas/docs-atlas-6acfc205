@@ -181,13 +181,15 @@ if err == nil {
 
 If `sender` is absent from the payload, `IsBot()` returns `false`.
 
-## HTTP-Level Testing with VerifyGitHubSignature
+## HTTP-Level Testing with Signature Verification
 
-For tests that exercise the full HTTP stack — verifying that your server correctly rejects unsigned requests, for example — use `VerifyGitHubSignature` to generate a correct `X-Hub-Signature-256` header value:
+For tests that exercise the full HTTP stack — verifying that your server correctly rejects unsigned requests, for example — you need to attach a valid `X-Hub-Signature-256` header to outgoing test requests. Compute the HMAC-SHA256 signature manually, then verify it independently using `VerifyGitHubSignature` if needed:
 
 ```go
 func VerifyGitHubSignature(secret, payload, signature string) error
 ```
+
+`VerifyGitHubSignature` **verifies** an existing signature string against the payload — it does not generate one. To create a valid signature for a test request, compute it with `crypto/hmac` directly, as shown below.
 
 In an HTTP test, compute and attach the header before sending the request:
 
@@ -236,7 +238,7 @@ func TestWebhookHTTP(t *testing.T) {
     Use `Receive()` with a crafted payload. No HTTP server, no real credentials, no network. Fast and deterministic.
   </Card>
   <Card title="Integration tests" icon="server">
-    Use `httptest.NewServer(app.WebhookHandler())` with `VerifyGitHubSignature` to generate valid signatures. Tests the full HTTP path including signature verification.
+    Use `httptest.NewServer(app.WebhookHandler())` and compute HMAC-SHA256 signatures manually to send signed requests. Tests the full HTTP path including signature verification.
   </Card>
   <Card title="Error path tests" icon="triangle-exclamation">
     Return errors from handlers registered in the test and assert that `Receive()` returns a non-nil error. Use `OnError` to capture errors for inspection.

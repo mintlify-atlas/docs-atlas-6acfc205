@@ -1,7 +1,7 @@
 ---
-title: "Connect probot-go to GitHub Enterprise Server"
+title: "Connect probot-go to a GitHub Enterprise Server Instance"
 sidebarTitle: "GitHub Enterprise"
-description: "Configure probot-go to use a GitHub Enterprise Server instance by setting the BaseURL option or the GHE_HOST environment variable."
+description: "Configure probot-go to target a GitHub Enterprise Server instance by setting the BaseURL option or the GHE_HOST environment variable."
 ---
 
 probot-go targets GitHub.com by default, but every part of its authentication and API client stack supports GitHub Enterprise Server (GHES). Point `BaseURL` at your GHES instance and probot-go routes all API calls, JWT authentication, and installation token requests through it without any other changes to your code.

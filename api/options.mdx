@@ -1,7 +1,7 @@
 ---
 title: "Options, OptionsFromEnv, and LoadEnvFile Reference"
 sidebarTitle: "Options"
-description: "Complete reference for probot-go's Options struct, all fields and defaults, OptionsFromEnv environment variable mapping, Defaults functional option, and LoadEnvFile."
+description: "Reference for probot-go's Options struct: all 12 fields and defaults, OptionsFromEnv env variable mapping, Defaults helper, and LoadEnvFile."
 ---
 
 `Options` is the single configuration object passed to `New`. Every field has a sensible default applied by `applyDefaults` before validation, so a minimal production configuration only needs `AppID` plus `PrivateKey`, or a `GithubToken`. `OptionsFromEnv` reads all fields from the process environment, and `LoadEnvFile` populates that environment from a `.env` style file before `OptionsFromEnv` is called.

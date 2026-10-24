@@ -1,7 +1,7 @@
 ---
-title: "GitHub App Authentication in probot-go"
+title: "GitHub Authentication in probot-go: App Mode and PAT"
 sidebarTitle: "Authentication"
-description: "probot-go supports GitHub App authentication with auto-refreshing installation tokens and personal access tokens. Credentials can be set via Options or environment variables."
+description: "probot-go supports GitHub App and PAT auth. Set credentials once; the framework handles JWT signing, token exchange, and per-installation client caching."
 ---
 
 probot-go handles GitHub authentication for you. Provide your credentials once when constructing the `Probot` instance and the framework takes care of signing JWT tokens, exchanging them for per-installation access tokens, caching those clients, and refreshing them before they expire. Inside a handler you simply call `ctx.GitHub()` and get back a ready-to-use API client.
@@ -45,6 +45,13 @@ When a webhook delivery arrives, `newContext` calls `authenticatedClient` which 
 ```go
 // From context.go — the framework calls this automatically.
 func (p *Probot) authenticatedClient(payload map[string]any) (*github.Client, error) {
+    p.credMu.RLock()
+    appClient := p.appClient
+    p.credMu.RUnlock()
+
+    if appClient == nil {
+        return nil, nil
+    }
     inst, _ := payload["installation"].(map[string]any)
     if id, ok := inst["id"].(float64); ok && id > 0 {
         return p.newInstallationClient(int64(id))

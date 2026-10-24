@@ -1,0 +1,312 @@
+---
+title: "GitHub Webhook Event Handling in probot-go"
+sidebarTitle: "Event Handling"
+description: "Learn how to subscribe to GitHub webhook events using On, OnMany, OnAny, and OnError in probot-go, and how to prevent bot feedback loops."
+---
+
+probot-go is built around a simple event-driven model: your app registers handler functions for the GitHub webhook events it cares about, and the framework routes each incoming delivery to the right handlers. Every handler receives a `*Context` containing the parsed payload, a pre-authenticated GitHub client, and a scoped logger — you never touch raw HTTP yourself.
+
+## Handler types
+
+Two function signatures form the foundation of the event system.
+
+```go
+// HandlerFunc is called for each matching webhook event delivery.
+type HandlerFunc func(ctx *Context) error
+
+// ErrorHandlerFunc is called when any HandlerFunc returns a non-nil error.
+type ErrorHandlerFunc func(ctx *Context, err error)
+```
+
+A `HandlerFunc` returning an error does **not** abort other registered handlers for the same event. All matching handlers run; their errors are collected, joined, and forwarded to the `ErrorHandlerFunc` registered with `OnError`.
+
+---
+
+## Subscribing to events
+
+### `On` — single event
+
+`On` registers a handler for one event name. The name can be either a bare event type or a qualified `event.action` pair.
+
+```go
+func (p *Probot) On(eventName string, fn HandlerFunc)
+```
+
+**Bare name** — matches any delivery of that event type, regardless of the `action` field:
+
+```go
+app.On("issues", func(ctx *probot.Context) error {
+    // fires for issues.opened, issues.closed, issues.labeled, …
+    ctx.Log().Info().Msg("an issue event arrived")
+    return nil
+})
+```
+
+**Qualified name** — matches only when `payload["action"]` equals the suffix:
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    issue, err := ctx.Issue()
+    if err != nil {
+        return err
+    }
+    ctx.Log().Info().
+        Str("repo", issue.Repo).
+        Int("number", issue.Number).
+        Msg("issue opened")
+    return nil
+})
+
+app.On("pull_request.opened", func(ctx *probot.Context) error {
+    pr, err := ctx.PullRequest()
+    if err != nil {
+        return err
+    }
+    ctx.Log().Info().Int("pr", pr.Number).Msg("PR opened")
+    return nil
+})
+```
+
+Common qualified names include `"push"` (no action field), `"issues.opened"`, `"issues.closed"`, `"pull_request.opened"`, `"pull_request.merged"`, `"check_run.created"`, and `"installation.created"`.
+
+---
+
+### `OnMany` — subscribe one handler to multiple events
+
+When the same logic applies to several events, pass a slice to `OnMany` instead of calling `On` repeatedly.
+
+```go
+func (p *Probot) OnMany(eventNames []string, fn HandlerFunc)
+```
+
+```go
+app.OnMany(
+    []string{"issues.opened", "pull_request.opened"},
+    func(ctx *probot.Context) error {
+        repo, err := ctx.Repo()
+        if err != nil {
+            return err
+        }
+        ctx.Log().Info().
+            Str("owner", repo.Owner).
+            Str("repo", repo.Repo).
+            Str("event", ctx.Name()).
+            Msg("new issue or PR opened")
+        return nil
+    },
+)
+```
+
+`OnMany` is a thin loop over `On`, so each name is registered independently — a delivery matching any one of them calls the handler once.
+
+---
+
+### `OnAny` — catch every event
+
+`OnAny` registers a handler that receives every webhook delivery regardless of event type or action. Multiple `OnAny` handlers are allowed and all run for each delivery.
+
+```go
+func (p *Probot) OnAny(fn HandlerFunc)
+```
+
+A common pattern is to use `OnAny` for audit logging:
+
+```go
+// Log every event — taken directly from the basic example.
+app.OnAny(func(ctx *probot.Context) error {
+    ctx.Log().Info().
+        Str("name", ctx.Name()).
+        Str("delivery_id", ctx.ID()).
+        Msg("received webhook event")
+    return nil
+})
+```
+
+`OnAny` handlers run **after** all matching `On` handlers for the same delivery.
+
+---
+
+### `OnError` — centralised error handling
+
+`OnError` registers a single `ErrorHandlerFunc` that is called whenever any `HandlerFunc` returns an error. Only one error handler can be active at a time; calling `OnError` again replaces the previous one.
+
+```go
+func (p *Probot) OnError(fn ErrorHandlerFunc)
+```
+
+```go
+app.OnError(func(ctx *probot.Context, err error) {
+    ctx.Log().Error().
+        Err(err).
+        Str("event", ctx.Name()).
+        Msg("webhook handler failed")
+})
+```
+
+<Note>
+The error handler is called with the joined error from **all** handlers that failed for the same delivery. Inspect `errors.Is` / `errors.As` or `errors.Unwrap` if you need to distinguish individual failures.
+</Note>
+
+---
+
+## Event name format
+
+The routing logic in `Receive` builds a *qualified* name by joining the top-level event name with the `action` field from the payload using a period separator.
+
+| Registration | Matches |
+|---|---|
+| `"issues"` | any delivery where `Name == "issues"` |
+| `"issues.opened"` | deliveries where `Name == "issues"` **and** `action == "opened"` |
+| `"push"` | any delivery where `Name == "push"` (no action field on push events) |
+| `"pull_request.closed"` | deliveries where `Name == "pull_request"` **and** `action == "closed"` |
+
+A handler registered as `"issues"` and a handler registered as `"issues.opened"` can **both** match the same delivery — there is no exclusivity.
+
+---
+
+## Modular apps with `Load` and `ApplicationFunc`
+
+For larger bots it is cleaner to split handler registration into separate functions that are loaded into the `Probot` instance rather than calling `On` directly in `main`.
+
+```go
+// ApplicationFunc receives the Probot and any load-time options.
+type ApplicationFunc func(app *Probot, opts ApplicationFunctionOptions) error
+
+func (p *Probot) Load(fns ...ApplicationFunc) error
+```
+
+`ApplicationFunctionOptions` currently carries a single field, `Cwd string`, which is set to `"."` by default.
+
+```go
+// issueHandler.go
+func IssueHandler(app *probot.Probot, opts probot.ApplicationFunctionOptions) error {
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        issue, err := ctx.Issue()
+        if err != nil {
+            return err
+        }
+        ctx.Log().Info().
+            Int("number", issue.Number).
+            Msg("issue opened")
+        return nil
+    })
+    return nil
+}
+
+// pushHandler.go
+func PushHandler(app *probot.Probot, opts probot.ApplicationFunctionOptions) error {
+    app.On("push", func(ctx *probot.Context) error {
+        ctx.Log().Info().Msg("push received")
+        return nil
+    })
+    return nil
+}
+
+// main.go
+if err := app.Load(IssueHandler, PushHandler); err != nil {
+    log.Fatal().Err(err).Msg("failed to load handlers")
+}
+```
+
+`Load` runs each function synchronously, so all handlers are registered before the server starts.
+
+---
+
+## Testing with `Receive`
+
+`Receive` dispatches a `WebhookEvent` directly through the handler pipeline without going through the HTTP layer. It is the primary tool for unit testing handlers.
+
+```go
+// WebhookEvent is the input to Receive.
+type WebhookEvent struct {
+    Name    string         // event type, e.g. "issues"
+    ID      string         // delivery ID
+    Payload map[string]any // parsed webhook JSON
+}
+
+func (p *Probot) Receive(event WebhookEvent) error
+```
+
+```go
+func TestIssueOpenedHandler(t *testing.T) {
+    app, _ := probot.New(probot.Options{GithubToken: "test-token"})
+
+    var called bool
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        called = true
+        return nil
+    })
+
+    err := app.Receive(probot.WebhookEvent{
+        Name: "issues",
+        ID:   "delivery-001",
+        Payload: map[string]any{
+            "action": "opened",
+            "issue":  map[string]any{"number": float64(42)},
+            "repository": map[string]any{
+                "name":  "my-repo",
+                "owner": map[string]any{"login": "octocat"},
+            },
+        },
+    })
+
+    if err != nil {
+        t.Fatal(err)
+    }
+    if !called {
+        t.Error("handler was not called")
+    }
+}
+```
+
+`Receive` returns a joined error if any handler fails, making it easy to assert on error conditions too.
+
+---
+
+## Preventing bot feedback loops
+
+When your app posts a comment or opens an issue it may trigger a new webhook delivery that your own handler would process — causing an infinite loop. Use `ctx.IsBot()` at the top of every handler that writes to GitHub.
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    // Ignore events caused by our own bot activity.
+    if ctx.IsBot() {
+        return nil
+    }
+
+    issue, err := ctx.Issue()
+    if err != nil {
+        return err
+    }
+
+    _, _, err = ctx.GitHub().Issues.CreateComment(
+        context.Background(),
+        issue.Owner, issue.Repo, issue.Number,
+        &github.IssueComment{Body: github.Ptr("Thanks for opening this issue!")},
+    )
+    return err
+})
+```
+
+`IsBot()` checks whether `payload["sender"]["type"]` equals `"Bot"`, which GitHub sets on all deliveries triggered by app and bot accounts.
+
+<Warning>
+Omitting the `IsBot()` guard in handlers that create issues, comments, or PRs is the most common cause of runaway webhook loops. Add it unconditionally before any write operation.
+</Warning>
+
+---
+
+## Running as a GitHub Action
+
+For CI-style use cases, `RunAction` reads `GITHUB_EVENT_PATH` and `GITHUB_EVENT_NAME` from the environment and dispatches the event through the same handler pipeline — no HTTP server required.
+
+```go
+if os.Getenv("GITHUB_ACTIONS") == "true" {
+    if err := app.RunAction(); err != nil {
+        log.Fatal().Err(err).Msg("action failed")
+    }
+    return
+}
+```
+
+All handlers registered with `On`, `OnMany`, and `OnAny` work identically in action mode.

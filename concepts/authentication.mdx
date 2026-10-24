@@ -1,0 +1,241 @@
+---
+title: "GitHub App Authentication in probot-go"
+sidebarTitle: "Authentication"
+description: "probot-go supports GitHub App authentication with auto-refreshing installation tokens and personal access tokens. Credentials can be set via Options or environment variables."
+---
+
+probot-go handles GitHub authentication for you. Provide your credentials once when constructing the `Probot` instance and the framework takes care of signing JWT tokens, exchanging them for per-installation access tokens, caching those clients, and refreshing them before they expire. Inside a handler you simply call `ctx.GitHub()` and get back a ready-to-use API client.
+
+## Two authentication modes
+
+<CardGroup cols={2}>
+  <Card title="GitHub App" icon="lock">
+    Uses `AppID` + `PrivateKey`. Generates a JWT for app-level calls and short-lived installation tokens for per-installation calls. Required for multi-repo or multi-org bots.
+  </Card>
+  <Card title="Personal Access Token" icon="key">
+    Uses a single `GithubToken`. Every API call carries the same token. Simpler to set up, best for single-repo integrations or local development.
+  </Card>
+</CardGroup>
+
+---
+
+## GitHub App mode
+
+GitHub Apps authenticate in two layers.
+
+**App-level (JWT)** — used for calls that don't belong to a specific installation, such as listing installations or fetching app metadata. Under the hood, `ghinstallation.NewAppsTransport` signs a short-lived JWT with your private key and attaches it to every request.
+
+**Installation-level** — used for calls against a specific repository or organisation. `ghinstallation.NewFromAppsTransport` wraps the app transport and automatically exchanges the JWT for an installation access token the first time a request is made, then refreshes it before it expires. probot-go caches one client per installation ID so the token exchange only happens once per installation per process lifetime.
+
+```go
+opts, err := probot.OptionsFromEnv()
+if err != nil {
+    log.Fatal().Err(err).Msg("invalid options")
+}
+// opts.AppID and opts.PrivateKey are populated from APP_ID and PRIVATE_KEY env vars.
+
+app, err := probot.New(opts)
+if err != nil {
+    log.Fatal().Err(err).Msg("failed to create probot")
+}
+```
+
+When a webhook delivery arrives, `newContext` calls `authenticatedClient` which reads `payload["installation"]["id"]` and either retrieves the cached installation client or builds a new one:
+
+```go
+// From context.go — the framework calls this automatically.
+func (p *Probot) authenticatedClient(payload map[string]any) (*github.Client, error) {
+    inst, _ := payload["installation"].(map[string]any)
+    if id, ok := inst["id"].(float64); ok && id > 0 {
+        return p.newInstallationClient(int64(id))
+    }
+    return appClient, nil
+}
+```
+
+The installation client cache lives in `installClients map[int64]*github.Client` on the `Probot` struct and is protected by a mutex, making it safe for concurrent webhook deliveries.
+
+---
+
+## Personal Access Token mode
+
+Set `GithubToken` in `Options` (or the `GITHUB_TOKEN` environment variable). The framework wraps the token in a `tokenAuthTransport` that adds `Authorization: Bearer <token>` to every outgoing request.
+
+```go
+app, err := probot.New(probot.Options{
+    GithubToken: os.Getenv("GITHUB_TOKEN"),
+    Secret:      os.Getenv("WEBHOOK_SECRET"),
+})
+```
+
+In PAT mode there is no concept of "installation" — `newInstallationClient` returns the same app-level client regardless of what `installation.id` appears in the payload. This is intentional: a PAT is scoped to a user or organisation and cannot be narrowed further.
+
+<Note>
+PAT mode is ideal for local development, single-repository tools, or scripts. For a bot that will be installed across many repositories or organisations, GitHub App mode is the correct choice.
+</Note>
+
+---
+
+## Credential requirements
+
+| Mode | `Options` fields required | Environment variables |
+|---|---|---|
+| GitHub App | `AppID` + `PrivateKey` | `APP_ID` + `PRIVATE_KEY` (or `PRIVATE_KEY_PATH`) |
+| Personal Access Token | `GithubToken` | `GITHUB_TOKEN` |
+| Setup wizard | _(none)_ | _(none — wizard writes credentials to `.env`)_ |
+
+If neither `GithubToken` nor `AppID` is set, `New` succeeds but logs a warning and serves only the setup wizard — no authenticated client is available until credentials are applied.
+
+---
+
+## The `Auth` method
+
+Outside of handlers — for example in startup code or background tasks — use `Probot.Auth` to obtain a client directly.
+
+```go
+func (p *Probot) Auth(installationID ...int64) (*github.Client, error)
+```
+
+- **No arguments** → returns the app-level JWT client.
+- **With an installation ID** → returns a client authenticated as that installation.
+
+```go
+// App-level client — useful for listing installations.
+appClient, err := app.Auth()
+if err != nil {
+    log.Fatal().Err(err).Msg("failed to get app client")
+}
+
+// Installation-level client for installation 12345678.
+installClient, err := app.Auth(12345678)
+if err != nil {
+    log.Fatal().Err(err).Msg("failed to get installation client")
+}
+```
+
+<Note>
+Inside webhook handlers, always prefer `ctx.GitHub()` over `app.Auth()`. The context client is already scoped to the installation that sent the event.
+</Note>
+
+---
+
+## Setting credentials via environment variables
+
+`OptionsFromEnv` reads all credentials from the process environment. Both bare names and `PROBOT_`-prefixed names are accepted (e.g. `PROBOT_APP_ID` works alongside `APP_ID`).
+
+```go
+opts, err := probot.OptionsFromEnv()
+if err != nil {
+    log.Fatal().Err(err).Msg("invalid environment")
+}
+app, err := probot.New(opts)
+```
+
+Recognised variables:
+
+| Variable | `Options` field | Notes |
+|---|---|---|
+| `APP_ID` | `AppID` | Numeric GitHub App ID as a string |
+| `PRIVATE_KEY` | `PrivateKey` | Full PEM contents |
+| `PRIVATE_KEY_PATH` | `PrivateKey` | Path to a `.pem` file; file is read into `PrivateKey` |
+| `GITHUB_TOKEN` | `GithubToken` | PAT or installation token |
+| `WEBHOOK_SECRET` | `Secret` | Webhook HMAC secret |
+| `GHE_HOST` | `BaseURL` | Expands to `https://<host>/api/v3` for GitHub Enterprise |
+
+---
+
+## Private key formats
+
+The `PrivateKey` field expects the **full PEM contents** of the private key file downloaded from your GitHub App's settings page — not a file path.
+
+<Tabs>
+  <Tab title="Inline PEM string">
+    ```go
+    app, err := probot.New(probot.Options{
+        AppID:      "12345",
+        PrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n",
+        Secret:     "my-webhook-secret",
+    })
+    ```
+  </Tab>
+  <Tab title="PRIVATE_KEY_PATH env var">
+    ```bash
+    export APP_ID=12345
+    export PRIVATE_KEY_PATH=/etc/mybot/github-app.pem
+    export WEBHOOK_SECRET=my-webhook-secret
+    ```
+
+    ```go
+    opts, err := probot.OptionsFromEnv() // reads and loads the file automatically
+    app, err := probot.New(opts)
+    ```
+  </Tab>
+  <Tab title=".env file">
+    The `LoadEnvFile` helper parses a `.env` file before `OptionsFromEnv` is called. Double-quoted values have escape sequences expanded, so a multi-line PEM stored as a single `\n`-escaped line is restored correctly:
+
+    ```bash
+    # .env
+    APP_ID=12345
+    PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
+    WEBHOOK_SECRET=my-webhook-secret
+    ```
+
+    ```go
+    if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+        log.Warn().Err(err).Msg("failed to load .env")
+    }
+    opts, err := probot.OptionsFromEnv()
+    app, err := probot.New(opts)
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Setup wizard
+
+When no credentials are configured, probot-go serves a GitHub App setup wizard at the root path (`/`). The wizard guides you through the GitHub App manifest flow and, once the app is created, writes `APP_ID`, `PRIVATE_KEY`, and `WEBHOOK_SECRET` directly to `.env` in the working directory. On the next startup `LoadEnvFile` picks them up automatically.
+
+```
+probot created without credentials — only the setup wizard will be served
+```
+
+<Steps>
+  <Step title="Start without credentials">
+    Run your app with no `APP_ID` or `GITHUB_TOKEN` set. The server starts and serves the wizard UI.
+  </Step>
+  <Step title="Register the GitHub App">
+    Follow the wizard in your browser. It submits a manifest to GitHub on your behalf and redirects back with the new app's credentials.
+  </Step>
+  <Step title="Credentials written to .env">
+    The wizard writes `APP_ID`, `PRIVATE_KEY`, and `WEBHOOK_SECRET` to `.env` in the current working directory and reloads the `Probot` instance without restarting the server.
+  </Step>
+  <Step title="Restart with credentials">
+    On subsequent starts, `LoadEnvFile(".env")` loads the written credentials and the app boots in full GitHub App mode.
+  </Step>
+</Steps>
+
+<Warning>
+The setup wizard is intended for local development and first-time registration. In production, supply credentials via environment variables or a secrets manager — never rely on the wizard in a deployed environment.
+</Warning>
+
+---
+
+## GitHub Enterprise Server
+
+Set `BaseURL` (or the `GHE_HOST` environment variable) to point the GitHub API client at your GHES instance. The base URL is propagated to both the `ghinstallation` transports and the go-github client.
+
+```go
+app, err := probot.New(probot.Options{
+    AppID:      os.Getenv("APP_ID"),
+    PrivateKey: os.Getenv("PRIVATE_KEY"),
+    Secret:     os.Getenv("WEBHOOK_SECRET"),
+    BaseURL:    "https://github.example.com/api/v3",
+})
+```
+
+Or via environment variable:
+
+```bash
+export GHE_HOST=github.example.com
+```

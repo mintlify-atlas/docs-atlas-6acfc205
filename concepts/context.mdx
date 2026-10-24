@@ -1,0 +1,312 @@
+---
+title: "The probot-go Context Object: Helpers and GitHub Client"
+sidebarTitle: "Context"
+description: "The Context object is passed to every probot-go handler. It provides a pre-authenticated GitHub client, structured logging, and helpers for extracting repo, issue, and PR data."
+---
+
+Every handler function in probot-go receives a single `*Context` argument. It wraps the raw GitHub webhook delivery — the event name, delivery ID, and parsed JSON payload — and bundles everything a handler typically needs: an authenticated GitHub API client scoped to the triggering installation, a zerolog logger pre-tagged with the event and delivery ID, and a set of convenience helpers so you rarely have to dig into the raw payload map yourself.
+
+## What lives in a Context
+
+```go
+type Context struct {
+    // unexported fields
+}
+```
+
+`Context` is constructed internally by `Receive` before any handler is called. You never instantiate it yourself, but you can inspect and use every exported method described below.
+
+---
+
+## Event identity
+
+<CardGroup cols={2}>
+  <Card title="Name() string" icon="tag">
+    Returns the top-level webhook event type, e.g. `"issues"` or `"push"`. This is the bare event name — never the qualified `event.action` form.
+  </Card>
+  <Card title="ID() string" icon="fingerprint">
+    Returns the unique delivery ID GitHub assigned to this webhook, sourced from the `X-GitHub-Delivery` header.
+  </Card>
+</CardGroup>
+
+```go
+app.OnAny(func(ctx *probot.Context) error {
+    ctx.Log().Info().
+        Str("name", ctx.Name()).
+        Str("delivery_id", ctx.ID()).
+        Msg("received webhook event")
+    return nil
+})
+```
+
+---
+
+## Accessing the payload
+
+### `Payload() map[string]any`
+
+Returns the full parsed webhook JSON as a `map[string]any`. Use this when you need fields that do not have a typed helper, or when working with event types that lack a corresponding struct in go-github.
+
+```go
+app.On("push", func(ctx *probot.Context) error {
+    commits, _ := ctx.Payload()["commits"].([]any)
+    ctx.Log().Info().Int("commit_count", len(commits)).Msg("push received")
+    return nil
+})
+```
+
+### `ParseInto(v any) error`
+
+Unmarshals the payload into any typed struct via a JSON round-trip. The go-github library ships typed event structs for every GitHub event — use `ParseInto` to get compile-time field access and avoid manual type assertions.
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    var ev github.IssuesEvent
+    if err := ctx.ParseInto(&ev); err != nil {
+        return err
+    }
+
+    ctx.Log().Info().
+        Str("title", ev.Issue.GetTitle()).
+        Str("user", ev.Issue.GetUser().GetLogin()).
+        Msg("issue opened")
+    return nil
+})
+```
+
+```go
+app.On("push", func(ctx *probot.Context) error {
+    var ev github.PushEvent
+    if err := ctx.ParseInto(&ev); err != nil {
+        return err
+    }
+
+    for _, commit := range ev.Commits {
+        ctx.Log().Info().Str("sha", commit.GetID()).Msg("commit in push")
+    }
+    return nil
+})
+```
+
+<Tip>
+Prefer `ParseInto` over direct `Payload()` access whenever a matching go-github event struct exists. Typed fields eliminate the `.(string)` and `.(float64)` assertions that are easy to get wrong.
+</Tip>
+
+---
+
+## GitHub API client
+
+### `GitHub() *github.Client`
+
+Returns the [go-github](https://github.com/google/go-github) client authenticated for the installation that triggered this event. Use it to call any GitHub REST API endpoint.
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    if ctx.IsBot() {
+        return nil
+    }
+
+    issue, err := ctx.Issue()
+    if err != nil {
+        return err
+    }
+
+    _, _, err = ctx.GitHub().Issues.CreateComment(
+        context.Background(),
+        issue.Owner, issue.Repo, issue.Number,
+        &github.IssueComment{
+            Body: github.Ptr("Thanks for opening this issue!"),
+        },
+    )
+    return err
+})
+```
+
+### `Octokit() *github.Client`
+
+An alias for `GitHub()`, mirroring the `context.octokit` naming from the original Node.js Probot framework. Both methods return the same client; use whichever name you prefer.
+
+#### How the client is authenticated
+
+When the payload contains an `installation.id` field, `Context` holds a client authenticated as that specific installation via a short-lived installation access token. If no installation is present (for example, on organisation-level events), it falls back to the app-level JWT client. See the [Authentication](/concepts/authentication) page for the full details.
+
+---
+
+## Structured logging
+
+### `Log() zerolog.Logger`
+
+Returns a [zerolog](https://github.com/rs/zerolog) logger pre-populated with the `event` and `delivery_id` fields, making every log line from a handler automatically traceable back to the specific webhook delivery that triggered it.
+
+```go
+app.On("pull_request.opened", func(ctx *probot.Context) error {
+    logger := ctx.Log()
+
+    pr, err := ctx.PullRequest()
+    if err != nil {
+        logger.Error().Err(err).Msg("could not extract PR params")
+        return err
+    }
+
+    logger.Info().
+        Str("repo", pr.Repo).
+        Int("number", pr.Number).
+        Msg("PR opened")
+    return nil
+})
+```
+
+The logger uses the level and format configured in `Options` (`LogLevel`, `LogFormat`).
+
+---
+
+## Repository, issue, and PR helpers
+
+These helpers extract structured parameter types from the payload so you can pass them directly to go-github API calls without writing boilerplate type assertions.
+
+### Structs
+
+```go
+// Repo identifies a GitHub repository.
+type Repo struct {
+    Owner string
+    Repo  string
+}
+
+// IssueParams identifies an issue or pull request.
+type IssueParams struct {
+    Owner  string
+    Repo   string
+    Number int
+}
+
+// PullRequestParams is an alias for IssueParams.
+type PullRequestParams = IssueParams
+```
+
+### `Repo() (Repo, error)`
+
+Extracts `owner` and `repo` from `payload["repository"]`. Returns an error for organisation-level or app-level events that carry no repository.
+
+```go
+app.On("push", func(ctx *probot.Context) error {
+    repo, err := ctx.Repo()
+    if err != nil {
+        return err
+    }
+    ctx.Log().Info().
+        Str("owner", repo.Owner).
+        Str("repo", repo.Repo).
+        Msg("push to repo")
+    return nil
+})
+```
+
+### `Issue() (IssueParams, error)`
+
+Extracts `owner`, `repo`, and `number` from the payload. It looks for a number in `payload["issue"]` first, then `payload["pull_request"]`, making it usable in both `issues.*` and `pull_request.*` handlers.
+
+```go
+app.On("issues.labeled", func(ctx *probot.Context) error {
+    issue, err := ctx.Issue()
+    if err != nil {
+        return err
+    }
+    // issue.Owner, issue.Repo, issue.Number are ready for go-github calls.
+    _, _, err = ctx.GitHub().Issues.AddLabelsToIssue(
+        context.Background(),
+        issue.Owner, issue.Repo, issue.Number,
+        []string{"needs-triage"},
+    )
+    return err
+})
+```
+
+### `PullRequest() (PullRequestParams, error)`
+
+Same as `Issue()` but searches `payload["pull_request"]` first, then `payload["issue"]`. Returns a `PullRequestParams` (which is a type alias for `IssueParams`).
+
+```go
+app.On("pull_request.opened", func(ctx *probot.Context) error {
+    pr, err := ctx.PullRequest()
+    if err != nil {
+        return err
+    }
+    ctx.Log().Info().
+        Str("repo", pr.Repo).
+        Int("number", pr.Number).
+        Msg("PR opened")
+    return nil
+})
+```
+
+---
+
+## Bot loop prevention
+
+### `IsBot() bool`
+
+Returns `true` when `payload["sender"]["type"]` is `"Bot"`. Check this at the start of any handler that writes to GitHub to avoid infinite feedback loops where your app triggers its own webhook.
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    if ctx.IsBot() {
+        return nil // ignore activity caused by our own app
+    }
+    // safe to write to GitHub from here
+    return nil
+})
+```
+
+---
+
+## Loading per-repository config
+
+### `Config(fileName string, defaults ...map[string]any) (map[string]any, error)`
+
+Reads a YAML or JSON configuration file from the `.github/` directory of the repository at its default branch. If the file is missing and no defaults are supplied, it returns `nil, nil`. If defaults are provided, they are shallow-merged with the file contents (file values take precedence).
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    cfg, err := ctx.Config("mybot.yml", map[string]any{
+        "greeting": "Thanks for opening this issue!",
+        "autoClose": false,
+    })
+    if err != nil {
+        return err
+    }
+
+    greeting, _ := cfg["greeting"].(string)
+    ctx.Log().Info().Str("greeting", greeting).Msg("loaded config")
+    return nil
+})
+```
+
+The `_extends` key is honoured: if the config file contains `_extends: "owner/repo"`, the base config is fetched from that repository and the local file is merged on top.
+
+<Note>
+`Config` uses the authenticated GitHub client from `ctx.GitHub()`, so it is subject to the same installation token scoping as any other API call — the app must have read access to the repository's contents.
+</Note>
+
+---
+
+## Quick reference
+
+<Accordion title="All Context methods at a glance">
+
+| Method | Returns | Description |
+|---|---|---|
+| `Name()` | `string` | Top-level event type, e.g. `"issues"` |
+| `ID()` | `string` | GitHub delivery ID |
+| `Payload()` | `map[string]any` | Raw parsed webhook JSON |
+| `ParseInto(v any)` | `error` | Unmarshal payload into a typed struct |
+| `GitHub()` | `*github.Client` | Authenticated go-github client |
+| `Octokit()` | `*github.Client` | Alias for `GitHub()` |
+| `Log()` | `zerolog.Logger` | Logger scoped to this delivery |
+| `IsBot()` | `bool` | True when sender is a GitHub bot |
+| `Repo()` | `(Repo, error)` | Owner and repo from payload |
+| `Issue()` | `(IssueParams, error)` | Owner, repo, and issue number |
+| `PullRequest()` | `(PullRequestParams, error)` | Owner, repo, and PR number |
+| `Config(fileName, …)` | `(map[string]any, error)` | Load `.github/<fileName>` config |
+
+</Accordion>

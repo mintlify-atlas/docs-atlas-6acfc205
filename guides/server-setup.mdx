@@ -1,0 +1,210 @@
+---
+title: "Run probot-go as a Standalone HTTP Server"
+sidebarTitle: "Server Setup"
+description: "Learn how to use NewServer to run your probot-go app, use the setup wizard for one-click app registration, and forward webhooks locally with Smee.io."
+---
+
+`probot-go` ships a production-ready HTTP server that wires together your webhook handler, the GitHub App setup wizard, and an optional Smee.io webhook proxy — all in a single call to `NewServer`. This is the quickest way to get a self-contained bot running without writing any HTTP boilerplate yourself.
+
+## NewServer and ServerOptions
+
+`NewServer` accepts a `ServerOptions` struct and returns a `*Server` ready to call `Start()` on.
+
+```go
+type ServerOptions struct {
+    Probot      *Probot // required
+    Host        string  // defaults to Probot option (localhost)
+    Port        int     // defaults to Probot option (3000)
+    WebhookPath string  // defaults to Probot option (/api/github/webhooks)
+    EnvFile     string  // path for persisting credentials; defaults to ".env"
+}
+
+func NewServer(o ServerOptions) *Server
+```
+
+Any field left at its zero value falls back to the corresponding value set on the `Probot` instance, so a minimal launch requires only `Probot`:
+
+```go
+server := probot.NewServer(probot.ServerOptions{Probot: app})
+```
+
+## Server Methods
+
+<Steps>
+  <Step title="Start the server">
+    `Start() error` begins listening on the configured host and port. It blocks until the server stops, so call it at the end of `main` or in its own goroutine.
+
+    ```go
+    if err := server.Start(); err != nil {
+        log.Fatal().Err(err).Msg("server failed")
+    }
+    ```
+  </Step>
+
+  <Step title="Graceful shutdown">
+    `Stop() error` shuts the server down cleanly, giving in-flight requests up to **5 seconds** to complete before forcibly closing connections.
+
+    ```go
+    // In a signal handler or test cleanup:
+    if err := server.Stop(); err != nil {
+        log.Error().Err(err).Msg("shutdown error")
+    }
+    ```
+  </Step>
+
+  <Step title="Use the raw handler">
+    `Handler() http.Handler` returns the fully assembled `http.ServeMux` without starting a listener. Useful for attaching the server's routes to a test server or a custom `http.Server`.
+
+    ```go
+    h := server.Handler()
+    ts := httptest.NewServer(h)
+    defer ts.Close()
+    ```
+  </Step>
+</Steps>
+
+## Routes Mounted by Handler()
+
+The mux returned by `Handler()` registers three routes:
+
+<CardGroup cols={3}>
+  <Card title="Webhook path" icon="webhook">
+    Defaults to `/api/github/webhooks`. All `POST` requests from GitHub land here; the handler verifies the `X-Hub-Signature-256` header before dispatching.
+  </Card>
+  <Card title="/ (root)" icon="wand-magic-sparkles">
+    Serves the setup wizard when the app is unconfigured, or a status page showing the App ID and webhook URL once credentials are loaded.
+  </Card>
+  <Card title="/setup/callback" icon="key">
+    Receives the one-time `code` from GitHub's manifest flow and exchanges it for app credentials.
+  </Card>
+</CardGroup>
+
+## Setup Wizard
+
+The setup wizard at `/` eliminates the need to manually create a GitHub App through the developer settings UI. It is shown automatically whenever `AppID` and `GithubToken` are both empty.
+
+<Steps>
+  <Step title="Start the server without credentials">
+    Pass an unconfigured `Probot` to `NewServer` and call `Start()`. The wizard will be served at `http://localhost:3000/`.
+
+    ```go
+    app, err := probot.New(probot.Options{})
+    if err != nil {
+        log.Fatal().Err(err).Msg("failed to create probot")
+    }
+    probot.NewServer(probot.ServerOptions{Probot: app}).Start()
+    ```
+  </Step>
+
+  <Step title="Fill in the registration form">
+    The wizard presents an HTML form pre-filled with sensible defaults. Enter your app's **name** and the **public webhook URL** (the base URL of your server, reachable from GitHub).
+
+    Default permissions selected for you:
+
+    | Permission | Level |
+    |---|---|
+    | checks | write |
+    | contents | write |
+    | discussions | write |
+    | issues | write |
+    | metadata | read |
+    | pull_requests | write |
+
+    Default events selected for you: `check_run`, `issues`, `issue_comment`, `pull_request`, `push`.
+  </Step>
+
+  <Step title="Redirect to GitHub">
+    On form submit the wizard builds a [manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest) from your choices and auto-submits it to `https://github.com/settings/apps/new`. GitHub guides you through app creation.
+  </Step>
+
+  <Step title="Credentials written automatically">
+    After creation GitHub redirects to `/setup/callback` with a one-time code. The server exchanges it for the app's ID, private key, and webhook secret, then writes them to the `.env` file (default: `.env` in the working directory):
+
+    ```
+    APP_ID=123456
+    WEBHOOK_SECRET=<generated>
+    PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."
+    ```
+
+    Credentials are also applied to the running `Probot` instance **immediately** — no restart required.
+  </Step>
+</Steps>
+
+<Tip>
+  On subsequent starts call `probot.LoadEnvFile(".env")` before `probot.New()` so the credentials written by the wizard are picked up automatically.
+</Tip>
+
+## Webhook Proxy (Smee.io)
+
+During local development GitHub cannot reach `localhost` directly. The built-in Smee.io client bridges the gap by maintaining a persistent SSE connection to a public proxy URL and forwarding every event to your local webhook path.
+
+Set `WebhookProxyURL` in `Options` or via the `WEBHOOK_PROXY_URL` environment variable:
+
+<Tabs>
+  <Tab title="In code">
+    ```go
+    opts, _ := probot.OptionsFromEnv()
+    opts.WebhookProxyURL = "https://smee.io/YOUR_CHANNEL_ID"
+
+    app, _ := probot.New(opts)
+    probot.NewServer(probot.ServerOptions{Probot: app}).Start()
+    ```
+  </Tab>
+  <Tab title="Via .env">
+    ```bash
+    WEBHOOK_PROXY_URL=https://smee.io/YOUR_CHANNEL_ID
+    ```
+  </Tab>
+</Tabs>
+
+When `Start()` is called and `WebhookProxyURL` is set, the proxy client starts in a background goroutine. If the SSE connection drops, it **automatically reconnects after 5 seconds**.
+
+<Warning>
+  Smee.io channels are public. Never use a production webhook secret with a shared proxy URL. Create a dedicated channel at [smee.io](https://smee.io) for each development environment.
+</Warning>
+
+## Full Example
+
+The following snippet mirrors the pattern used in the `example/basic` directory of the source repository:
+
+```go
+package main
+
+import (
+    "fmt"
+    "os"
+
+    "github.com/rs/zerolog/log"
+    probot "github.com/Pratyay360/probot-go"
+)
+
+func main() {
+    // Load credentials from .env if present.
+    if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+        log.Warn().Err(err).Msg("failed to load .env")
+    }
+
+    opts, err := probot.OptionsFromEnv()
+    if err != nil {
+        log.Fatal().Err(err).Msg("invalid options from environment")
+    }
+
+    app, err := probot.New(opts)
+    if err != nil {
+        log.Fatal().Err(err).Msg("failed to create probot")
+    }
+
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        ctx.Log().Info().Msg("new issue opened")
+        return nil
+    })
+
+    fmt.Printf("probot %s listening on http://%s:%d%s\n",
+        app.Version(), opts.Host, opts.Port, app.WebhookPath())
+
+    server := probot.NewServer(probot.ServerOptions{Probot: app})
+    if err := server.Start(); err != nil {
+        log.Fatal().Err(err).Msg("server failed")
+    }
+}
+```

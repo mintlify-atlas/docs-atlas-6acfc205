@@ -1,0 +1,247 @@
+---
+title: "Testing probot-go Apps with Receive and Simulated Events"
+sidebarTitle: "Testing"
+description: "Test your probot-go GitHub App handlers offline using Receive() to simulate webhook events without an HTTP server or real GitHub credentials."
+---
+
+Testing GitHub App handlers end-to-end traditionally requires a live server and real webhook deliveries. probot-go provides a much faster path: `Receive()` lets you inject a fully-formed `WebhookEvent` directly into the handler pipeline, bypassing HTTP entirely. Your handlers run synchronously, errors are returned as standard Go errors, and the whole test suite stays offline.
+
+## Receive and WebhookEvent
+
+```go
+func (p *Probot) Receive(event WebhookEvent) error
+
+type WebhookEvent struct {
+    Name    string         // top-level event name, e.g. "issues"
+    ID      string         // arbitrary delivery ID for tracing
+    Payload map[string]any // parsed JSON payload
+}
+```
+
+`Receive` builds a `Context` from the event (including an authenticated GitHub client if credentials were supplied), matches the event name and action against every registered handler, runs matching handlers in registration order, and returns a joined error if any handler returned an error. The `OnAny` handlers run after event-specific handlers.
+
+## Writing a Basic Test
+
+<Steps>
+  <Step title="Construct a Probot in test mode">
+    Use a static `GithubToken` to satisfy the credentials requirement. For tests that only exercise handler logic and never call the GitHub API, any non-empty token value works.
+
+    ```go
+    app, err := probot.New(probot.Options{
+        GithubToken: "test-token",
+        Secret:      "test-secret",
+    })
+    if err != nil {
+        t.Fatal(err)
+    }
+    ```
+  </Step>
+
+  <Step title="Register your handler">
+    Register the same handler you use in production. There is nothing test-specific about the registration.
+
+    ```go
+    called := false
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        called = true
+        return nil
+    })
+    ```
+  </Step>
+
+  <Step title="Build a minimal payload">
+    Construct a `map[string]any` that contains the fields your handler reads. The `action` key inside the payload determines which qualified event name (`issues.opened`, `pull_request.closed`, etc.) is matched.
+
+    ```go
+    payload := map[string]any{
+        "action": "opened",
+        "issue":  map[string]any{"number": float64(1)},
+        "repository": map[string]any{
+            "name":  "my-repo",
+            "owner": map[string]any{"login": "myorg"},
+        },
+    }
+    ```
+
+    <Note>
+      JSON numbers decoded into `map[string]any` are always `float64` in Go. Use `float64(1)` rather than `int(1)` when building test payloads to match what `json.Unmarshal` produces from real GitHub payloads.
+    </Note>
+  </Step>
+
+  <Step title="Call Receive and assert">
+    ```go
+    err = app.Receive(probot.WebhookEvent{
+        Name:    "issues",
+        ID:      "test-001",
+        Payload: payload,
+    })
+    if err != nil {
+        t.Errorf("unexpected error: %v", err)
+    }
+    if !called {
+        t.Error("handler was not called")
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete Test Example
+
+```go
+package mybot_test
+
+import (
+    "testing"
+
+    probot "github.com/Pratyay360/probot-go"
+)
+
+func TestIssueHandler(t *testing.T) {
+    app, err := probot.New(probot.Options{
+        GithubToken: "test-token",
+        Secret:      "test-secret",
+    })
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    called := false
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        called = true
+        return nil
+    })
+
+    err = app.Receive(probot.WebhookEvent{
+        Name: "issues",
+        ID:   "test-001",
+        Payload: map[string]any{
+            "action": "opened",
+            "issue":  map[string]any{"number": float64(1)},
+            "repository": map[string]any{
+                "name":  "my-repo",
+                "owner": map[string]any{"login": "myorg"},
+            },
+        },
+    })
+    if err != nil {
+        t.Errorf("unexpected error: %v", err)
+    }
+    if !called {
+        t.Error("handler was not called")
+    }
+}
+```
+
+## Testing Handler Errors
+
+`Receive` returns a joined error containing every error returned by matching handlers. Assert on the error value directly:
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    return fmt.Errorf("something went wrong")
+})
+
+err := app.Receive(probot.WebhookEvent{
+    Name:    "issues",
+    Payload: map[string]any{"action": "opened"},
+})
+if err == nil {
+    t.Error("expected an error but got nil")
+}
+```
+
+## Testing Bot Detection (IsBot)
+
+`ctx.IsBot()` returns `true` when `payload["sender"]["type"]` equals `"Bot"`. In tests, set this field explicitly to simulate a bot sender:
+
+<Tabs>
+  <Tab title="Human sender (default)">
+    ```go
+    payload := map[string]any{
+        "action": "opened",
+        "sender": map[string]any{
+            "login": "octocat",
+            "type":  "User",
+        },
+    }
+    ```
+  </Tab>
+  <Tab title="Bot sender">
+    ```go
+    payload := map[string]any{
+        "action": "opened",
+        "sender": map[string]any{
+            "login": "my-bot[bot]",
+            "type":  "Bot",
+        },
+    }
+    ```
+  </Tab>
+</Tabs>
+
+If `sender` is absent from the payload, `IsBot()` returns `false`.
+
+## HTTP-Level Testing with VerifyGitHubSignature
+
+For tests that exercise the full HTTP stack — verifying that your server correctly rejects unsigned requests, for example — use `VerifyGitHubSignature` to generate a correct `X-Hub-Signature-256` header value:
+
+```go
+func VerifyGitHubSignature(secret, payload, signature string) error
+```
+
+In an HTTP test, compute and attach the header before sending the request:
+
+```go
+func TestWebhookHTTP(t *testing.T) {
+    app, _ := probot.New(probot.Options{
+        GithubToken: "test-token",
+        Secret:      "my-webhook-secret",
+    })
+
+    server := httptest.NewServer(app.WebhookHandler())
+    defer server.Close()
+
+    body := `{"action":"opened","issue":{"number":1}}`
+    secret := "my-webhook-secret"
+
+    // Compute HMAC-SHA256 signature.
+    mac := hmac.New(sha256.New, []byte(secret))
+    mac.Write([]byte(body))
+    sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+    req, _ := http.NewRequest(http.MethodPost, server.URL, strings.NewReader(body))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-GitHub-Event", "issues")
+    req.Header.Set("X-GitHub-Delivery", "test-http-001")
+    req.Header.Set("X-Hub-Signature-256", sig)
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        t.Fatal(err)
+    }
+    if resp.StatusCode != http.StatusOK {
+        t.Errorf("expected 200, got %d", resp.StatusCode)
+    }
+}
+```
+
+<Tip>
+  To assert that an unsigned request is rejected, simply omit the `X-Hub-Signature-256` header. The handler returns HTTP 401.
+</Tip>
+
+## Patterns Summary
+
+<CardGroup cols={2}>
+  <Card title="Unit tests" icon="flask">
+    Use `Receive()` with a crafted payload. No HTTP server, no real credentials, no network. Fast and deterministic.
+  </Card>
+  <Card title="Integration tests" icon="server">
+    Use `httptest.NewServer(app.WebhookHandler())` with `VerifyGitHubSignature` to generate valid signatures. Tests the full HTTP path including signature verification.
+  </Card>
+  <Card title="Error path tests" icon="triangle-exclamation">
+    Return errors from handlers registered in the test and assert that `Receive()` returns a non-nil error. Use `OnError` to capture errors for inspection.
+  </Card>
+  <Card title="Bot guard tests" icon="robot">
+    Set `payload["sender"]["type"] = "Bot"` to simulate a bot-triggered event and verify your handler short-circuits correctly via `ctx.IsBot()`.
+  </Card>
+</CardGroup>

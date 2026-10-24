@@ -1,0 +1,125 @@
+---
+title: "Connect probot-go to GitHub Enterprise Server"
+sidebarTitle: "GitHub Enterprise"
+description: "Configure probot-go to use a GitHub Enterprise Server instance by setting the BaseURL option or the GHE_HOST environment variable."
+---
+
+probot-go targets GitHub.com by default, but every part of its authentication and API client stack supports GitHub Enterprise Server (GHES). Point `BaseURL` at your GHES instance and probot-go routes all API calls, JWT authentication, and installation token requests through it without any other changes to your code.
+
+## BaseURL Option
+
+Set `BaseURL` in `Options` to the REST API root of your GHES instance. The format follows the standard GHES API path convention:
+
+```go
+app, err := probot.New(probot.Options{
+    AppID:      os.Getenv("APP_ID"),
+    PrivateKey: os.Getenv("PRIVATE_KEY"),
+    Secret:     os.Getenv("WEBHOOK_SECRET"),
+    BaseURL:    "https://github.yourcompany.com/api/v3",
+})
+if err != nil {
+    log.Fatal().Err(err).Msg("failed to create probot")
+}
+```
+
+When `BaseURL` is set, probot-go passes it to `github.WithEnterpriseURLs(baseURL, baseURL)` on every `go-github` client it creates, and sets `BaseURL` on both the `ghinstallation.AppsTransport` (used for JWT-based app-level calls) and each `ghinstallation.Transport` (used for per-installation token calls). No additional configuration is needed.
+
+## GHE\_HOST Environment Variable
+
+`OptionsFromEnv` reads the `GHE_HOST` variable and constructs `BaseURL` automatically:
+
+```bash
+export GHE_HOST=github.yourcompany.com
+```
+
+This is equivalent to setting `BaseURL: "https://github.yourcompany.com/api/v3"` in code. Use `GHE_HOST` to keep your configuration portable across environments without changing source code.
+
+<Tabs>
+  <Tab title="Environment variables">
+    ```bash
+    export APP_ID=12345
+    export PRIVATE_KEY_PATH=/secrets/app.pem
+    export WEBHOOK_SECRET=my-secret
+    export GHE_HOST=github.yourcompany.com
+    ```
+
+    Then load them in the standard way:
+
+    ```go
+    opts, err := probot.OptionsFromEnv()
+    if err != nil {
+        log.Fatal().Err(err).Msg("invalid options")
+    }
+    app, err := probot.New(opts)
+    ```
+  </Tab>
+  <Tab title=".env file">
+    ```bash
+    APP_ID=12345
+    PRIVATE_KEY_PATH=/secrets/app.pem
+    WEBHOOK_SECRET=my-secret
+    GHE_HOST=github.yourcompany.com
+    ```
+
+    ```go
+    probot.LoadEnvFile(".env")
+    opts, _ := probot.OptionsFromEnv()
+    app, _ := probot.New(opts)
+    ```
+  </Tab>
+  <Tab title="Inline Options">
+    ```go
+    app, err := probot.New(probot.Options{
+        AppID:      "12345",
+        PrivateKey: string(pemBytes),
+        Secret:     "my-secret",
+        BaseURL:    "https://github.yourcompany.com/api/v3",
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## How BaseURL Is Applied Internally
+
+<Accordion title="App-level (JWT) transport">
+  When probot-go builds the app-level GitHub client it creates a `ghinstallation.AppsTransport` with the parsed private key and app ID. If `BaseURL` is non-empty, `tr.BaseURL` is set to that value. This ensures that requests for app metadata and installation listings are sent to the GHES API rather than `api.github.com`.
+</Accordion>
+
+<Accordion title="Installation token transport">
+  Each per-installation client uses a `ghinstallation.Transport` wrapping the `AppsTransport`. The same `BaseURL` is applied to this transport so that the token exchange endpoint (`POST /app/installations/{id}/access_tokens`) is also called on the GHES instance.
+</Accordion>
+
+<Accordion title="go-github client">
+  The `github.Client` itself is constructed with `github.WithEnterpriseURLs(baseURL, baseURL)`. This overrides both the REST API base URL and the upload URL, which is correct for standard GHES deployments where both are under the same hostname.
+</Accordion>
+
+<Accordion title="Live credential updates (setup wizard)">
+  If you use the setup wizard to register the app at runtime, `applyCredentials` reads `opts.BaseURL` when building replacement transports and clients. GHES support therefore survives a credential hot-swap without a restart.
+</Accordion>
+
+## Verifying Connectivity
+
+After configuration, confirm that probot-go can reach your GHES instance by checking the structured log output on startup. A successful app-level client initialization logs:
+
+```text
+INF starting probot server addr=localhost:3000 webhook=/api/github/webhooks
+```
+
+If the private key or app ID is wrong for your GHES instance, `probot.New` returns an error before the server starts.
+
+<Warning>
+  Make sure your GHES instance uses a TLS certificate trusted by the machine running probot-go. Self-signed or internal CA certificates require either installing the CA into the system trust store or providing a custom `http.Transport` with the CA bundle loaded.
+</Warning>
+
+## github.com vs GHES
+
+`BaseURL` is optional. Leave it empty (or do not set `GHE_HOST`) to target github.com — the default behaviour. The same binary can be pointed at either environment purely through configuration.
+
+<CardGroup cols={2}>
+  <Card title="GitHub.com" icon="github">
+    `BaseURL` empty. All clients use `https://api.github.com`. No extra configuration needed.
+  </Card>
+  <Card title="GitHub Enterprise Server" icon="building">
+    `BaseURL: "https://<host>/api/v3"` or `GHE_HOST=<host>`. All clients, transports, and token exchanges route through your GHES instance.
+  </Card>
+</CardGroup>

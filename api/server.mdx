@@ -1,0 +1,200 @@
+---
+title: "Server Type: HTTP Server and Setup Wizard Reference"
+sidebarTitle: "Server"
+description: "Reference for probot-go's Server type: NewServer constructor, ServerOptions fields, Start/Stop lifecycle, Handler for testing, and mounted routes."
+---
+
+`Server` wraps a `Probot` instance in a complete `net/http` server. It mounts the webhook handler at the configured path, exposes a setup wizard at `/` when no GitHub App credentials are present, handles the manifest-flow OAuth callback that GitHub redirects to after app creation, and optionally opens a persistent connection to a webhook proxy (e.g. Smee.io) for local development. `Server` is the easiest way to get a probot-go app running end-to-end.
+
+## Import
+
+```go
+import probot "github.com/Pratyay360/probot-go"
+```
+
+---
+
+## ServerOptions Struct
+
+```go
+type ServerOptions struct {
+    Probot      *Probot
+    Host        string
+    Port        int
+    WebhookPath string
+    EnvFile     string
+}
+```
+
+<ResponseField name="Probot" type="*Probot" required>
+  The `Probot` instance to serve. Must not be `nil`.
+</ResponseField>
+
+<ResponseField name="Host" type="string">
+  Hostname or IP address to bind. Falls back to `Probot.Options().Host` (default
+  `"localhost"`) when empty.
+</ResponseField>
+
+<ResponseField name="Port" type="int">
+  TCP port to listen on. Falls back to `Probot.Options().Port` (default `3000`)
+  when zero.
+</ResponseField>
+
+<ResponseField name="WebhookPath" type="string">
+  URL path the webhook handler is mounted on. Falls back to
+  `Probot.Options().WebhookPath` (default `"/api/github/webhooks"`) when empty.
+</ResponseField>
+
+<ResponseField name="EnvFile" type="string" default=".env">
+  Path to the file where the setup wizard writes credentials after a successful
+  manifest flow registration. Defaults to `".env"` in the process working
+  directory.
+</ResponseField>
+
+---
+
+## Constructor
+
+### `NewServer`
+
+```go
+func NewServer(o ServerOptions) *Server
+```
+
+Creates a `Server`. All zero-valued fields in `ServerOptions` fall back to the
+corresponding values in `o.Probot.Options()`, so you only need to set fields
+that differ from the `Probot` configuration.
+
+<ParamField path="o" type="ServerOptions" required>
+  Configuration for the server. `Probot` is the only required field.
+</ParamField>
+
+```go
+opts, _ := probot.OptionsFromEnv()
+app, _ := probot.New(opts)
+
+app.On("issues.opened", func(ctx *probot.Context) error {
+    ctx.Log().Info().Msg("issue opened")
+    return nil
+})
+
+srv := probot.NewServer(probot.ServerOptions{Probot: app})
+if err := srv.Start(); err != nil {
+    log.Fatal(err)
+}
+```
+
+---
+
+## Lifecycle Methods
+
+### `Start`
+
+```go
+func (s *Server) Start() error
+```
+
+Builds the HTTP handler, starts the TCP listener, and blocks until the server
+stops. Internally calls `http.Server.ListenAndServe`. Returns `nil` on a clean
+shutdown (i.e. when `Stop` triggers `http.ErrServerClosed`); returns any other
+error from `ListenAndServe` otherwise.
+
+If `Probot.Options().WebhookProxyURL` is non-empty, `Start` also launches a
+background goroutine that connects to the proxy URL as an SSE client and
+forwards each event to the local webhook handler. The goroutine reconnects
+automatically after a 5-second delay on failure.
+
+<Note>
+  `Start` blocks the calling goroutine. Run it in a goroutine or as the last
+  statement in `main`, and use `Stop` from another goroutine (e.g. on
+  `os.Signal`) to shut it down gracefully.
+</Note>
+
+```go
+go func() {
+    c := make(chan os.Signal, 1)
+    signal.Notify(c, os.Interrupt)
+    <-c
+    _ = srv.Stop()
+}()
+
+log.Fatal(srv.Start())
+```
+
+---
+
+### `Stop`
+
+```go
+func (s *Server) Stop() error
+```
+
+Initiates a graceful HTTP shutdown with a **5-second timeout**. Active
+connections are given up to 5 seconds to complete; the server then closes.
+Returns `nil` if the server was never started (i.e. `Start` was not called
+before `Stop`). Returns any error from `http.Server.Shutdown`.
+
+---
+
+## Handler
+
+### `Handler`
+
+```go
+func (s *Server) Handler() http.Handler
+```
+
+Constructs and returns the full `http.ServeMux` for this server without
+starting it. Use this method in tests to create an `httptest.Server` or call
+`httptest.NewRecorder` directly, without binding to a real port.
+
+```go
+srv := probot.NewServer(probot.ServerOptions{Probot: app})
+ts := httptest.NewServer(srv.Handler())
+defer ts.Close()
+
+resp, err := http.Post(
+    ts.URL+"/api/github/webhooks",
+    "application/json",
+    strings.NewReader(`{"action":"opened",...}`),
+)
+```
+
+---
+
+## Mounted Routes
+
+The handler returned by `Handler` (and used internally by `Start`) registers
+the following routes on a `http.ServeMux`:
+
+| Path | Handler | Notes |
+|---|---|---|
+| `<WebhookPath>` | Webhook handler (HMAC-verified) | Exact path match, e.g. `/api/github/webhooks` |
+| `/` | Setup wizard or status page | Shows wizard when unconfigured; shows app status otherwise |
+| `/setup/callback` | Manifest flow OAuth callback | GitHub redirects here after app creation |
+| `<WebhookPath>/setup/callback` | Same callback, alternate path | Registered only when `WebhookPath` is non-empty and not `"/"` |
+
+#### Setup Wizard (`/`)
+
+When `AppID` and `GithubToken` are both unset, `GET /` renders an HTML form
+where you name your app, choose permissions and events, and supply a public
+webhook URL. Submitting the form redirects your browser to
+`https://github.com/settings/apps/new` with a pre-filled manifest. After you
+confirm, GitHub redirects back to `/setup/callback`.
+
+When credentials are already configured, `GET /` renders a brief status page
+showing the App ID and webhook URL.
+
+#### Setup Callback (`/setup/callback`)
+
+After the manifest flow completes, GitHub sends a `code` query parameter to
+this endpoint. The server exchanges it for the app's credentials via the GitHub
+API, writes them to `EnvFile`, and applies them to the running `Probot`
+instance immediately — no restart is required for incoming webhooks to start
+validating.
+
+<Warning>
+  The setup wizard is a convenience tool for initial registration. In
+  production, remove the wizard route or protect it with network access controls
+  — it does not require authentication to trigger a manifest-flow registration.
+</Warning>

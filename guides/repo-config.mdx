@@ -1,0 +1,177 @@
+---
+title: "Load Per-Repo Configuration in probot-go"
+sidebarTitle: "Repo Config"
+description: "Use ctx.Config() to load .github/config.yml from a repository with default values, deep-merge inheritance, and cross-repo _extends support."
+---
+
+Hard-coding behavior inside your bot limits its usefulness across repositories. `ctx.Config()` solves this by fetching a YAML or JSON configuration file from `.github/` in the target repository at event time, merging it with your built-in defaults, and optionally inheriting a shared base config from another repository. Repository owners can customize their bot behavior without touching your code.
+
+## ctx.Config()
+
+```go
+func (c *Context) Config(fileName string, defaultConfig ...map[string]any) (map[string]any, error)
+```
+
+`Config` fetches `.github/<fileName>` from the repository's default branch using the authenticated GitHub client already attached to the context.
+
+<ParamField path="fileName" type="string" required>
+  The file name (with extension) inside `.github/`. For example, `"bot-config.yml"` fetches `.github/bot-config.yml`.
+</ParamField>
+
+<ParamField path="defaultConfig" type="map[string]any">
+  Optional fallback values. If the repository does not have the config file, these defaults are returned as-is. Nested maps are deep-merged so repository-specific keys override defaults without replacing entire sub-trees.
+</ParamField>
+
+### Return Values
+
+| Scenario | Return value |
+|---|---|
+| File found, no defaults | Parsed file content |
+| File found, defaults provided | Deep-merge of defaults and file (file wins on conflict) |
+| File not found, defaults provided | Defaults as-is |
+| File not found, no defaults | `nil, nil` |
+| GitHub API error (non-404) | `nil, error` |
+| Invalid YAML/JSON | `nil, parse error` |
+
+## Basic Usage
+
+Create a configuration file in the target repository and read it in your handler:
+
+<Tabs>
+  <Tab title=".github/bot-config.yml">
+    ```yaml
+    # .github/bot-config.yml
+    greeting: "Thanks for your contribution!"
+    labels:
+      - "needs-review"
+    ```
+  </Tab>
+  <Tab title="Handler code">
+    ```go
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        defaults := map[string]any{
+            "greeting": "Hello!",
+            "labels":   []any{},
+        }
+
+        cfg, err := ctx.Config("bot-config.yml", defaults)
+        if err != nil {
+            return err
+        }
+
+        greeting, _ := cfg["greeting"].(string)
+        ctx.Log().Info().Str("greeting", greeting).Msg("loaded config")
+
+        return nil
+    })
+    ```
+  </Tab>
+</Tabs>
+
+If the repository has `.github/bot-config.yml` with `greeting: "Thanks for your contribution!"`, that value overrides the `"Hello!"` default. Any keys absent from the repository file are filled in from `defaults`.
+
+## Deep Merging
+
+`Config` uses a recursive deep-merge strategy for nested maps. Top-level scalar values and arrays from the repo file win outright; nested maps are merged key-by-key so only the keys that exist in the repo file are overridden.
+
+```go
+// defaults:
+map[string]any{
+    "labels": map[string]any{
+        "bug":     "d73a4a",
+        "feature": "0075ca",
+    },
+}
+
+// .github/bot-config.yml:
+// labels:
+//   bug: "ee0701"    <- overrides default
+//   # feature key is absent, so default is kept
+
+// result:
+map[string]any{
+    "labels": map[string]any{
+        "bug":     "ee0701",  // from repo config
+        "feature": "0075ca",  // from default
+    },
+}
+```
+
+## Cross-Repo Inheritance with \_extends
+
+Add `_extends: "owner/repo"` to a repository's config file to inherit a base configuration from another repository. probot-go fetches the **same file name** from the referenced repo, then deep-merges it as the base layer — the current repo's config overrides the base.
+
+```yaml
+# .github/bot-config.yml in any repository
+_extends: "myorg/.github"
+greeting: "Hi from this specific repo!"
+```
+
+```yaml
+# .github/bot-config.yml in myorg/.github
+greeting: "Hello from the org default!"
+labels:
+  - "triage"
+auto_close: false
+```
+
+The merged result for the first repository:
+
+```yaml
+greeting: "Hi from this specific repo!"   # repo-level override wins
+labels:
+  - "triage"                               # inherited from myorg/.github
+auto_close: false                          # inherited from myorg/.github
+```
+
+<Tip>
+  A common pattern is to create a `.github` repository at the organization level (e.g. `myorg/.github`) that holds shared bot configuration, then `_extends: myorg/.github` in per-repository configs to inherit org-wide defaults while still allowing repo-level overrides.
+</Tip>
+
+<Note>
+  `_extends` is resolved recursively — the base repo's config can itself contain `_extends`. The `_extends` key is stripped from the result before it is returned to your handler.
+</Note>
+
+## Error Handling
+
+<Accordion title="File not found (404)">
+  A missing `.github/<fileName>` is treated as an empty file, not an error. If you provided defaults they are returned; otherwise `Config` returns `nil, nil`. Your handler should check for `nil` before reading keys.
+
+  ```go
+  cfg, err := ctx.Config("bot-config.yml")
+  if err != nil {
+      return err
+  }
+  if cfg == nil {
+      // No config file and no defaults — skip optional behavior.
+      return nil
+  }
+  ```
+</Accordion>
+
+<Accordion title="GitHub API error (non-404)">
+  Network failures, rate-limit errors, or permission errors from the GitHub API are returned as a wrapped error. Log and return the error so the delivery is retried by GitHub's webhook system.
+
+  ```go
+  cfg, err := ctx.Config("bot-config.yml", defaults)
+  if err != nil {
+      ctx.Log().Error().Err(err).Msg("failed to load config")
+      return err
+  }
+  ```
+</Accordion>
+
+<Accordion title="Invalid YAML or JSON">
+  If the file exists but cannot be parsed, `Config` returns a parse error. Validate the config file syntax locally with `yamllint` or a JSON linter before committing.
+</Accordion>
+
+## Supported File Formats
+
+`Config` accepts both YAML and JSON. The format is detected automatically from the file content (JSON is tried first; YAML is the fallback). Either `.yml` or `.yaml` extensions work for YAML, and `.json` for JSON.
+
+```go
+// These all work:
+cfg, _ := ctx.Config("bot.yml")
+cfg, _ := ctx.Config("bot.yaml")
+cfg, _ := ctx.Config("bot.json")
+```

@@ -1,0 +1,349 @@
+---
+title: "Configure probot-go: Options, Env Vars, and .env Files"
+sidebarTitle: "Configuration"
+description: "Reference for all probot-go Options fields, supported environment variables, the Defaults functional option, and .env file loading with LoadEnvFile."
+---
+
+probot-go is configured through the `Options` struct, which is passed to `probot.New()`. Every field has a zero value that maps to a sensible default, so you only need to supply the credentials and any overrides your app requires. This page documents every field, the matching environment variables that `OptionsFromEnv()` reads, the `Defaults()` functional option pattern, and the `LoadEnvFile()` helper.
+
+## Options Struct
+
+`Options` is defined in `options.go`. You construct it directly or populate it via `OptionsFromEnv()` and pass it to `probot.New()`:
+
+```go
+app, err := probot.New(probot.Options{
+    AppID:      "123456",
+    PrivateKey: os.Getenv("PRIVATE_KEY"),
+    Secret:     os.Getenv("WEBHOOK_SECRET"),
+})
+```
+
+Either `AppID` + `PrivateKey` **or** `GithubToken` must be set. All other fields are optional and fall back to the defaults listed below.
+
+### Authentication Fields
+
+<ParamField body="AppID" type="string" required>
+  The numeric ID of your GitHub App, as a string. Found on your app's settings page at `https://github.com/settings/apps/<app-name>`. Required unless `GithubToken` is set.
+
+  ```go
+  AppID: "123456",
+  ```
+</ParamField>
+
+<ParamField body="PrivateKey" type="string">
+  The full PEM contents of the private key downloaded from your GitHub App's settings page. Required when `AppID` is set and `GithubToken` is not. You can load it from a file with `os.ReadFile` or via the `PRIVATE_KEY_PATH` environment variable (handled automatically by `OptionsFromEnv`).
+
+  ```go
+  PrivateKey: os.Getenv("PRIVATE_KEY"),
+  ```
+
+  <Note>
+    The PEM must include the full header and footer lines (`-----BEGIN RSA PRIVATE KEY-----` … `-----END RSA PRIVATE KEY-----`) with real newlines, not escaped `\n`. `LoadEnvFile` expands escape sequences automatically when loading from a `.env` file.
+  </Note>
+</ParamField>
+
+<ParamField body="Secret" type="string" default="development">
+  The webhook secret configured in your GitHub App's settings. GitHub signs every delivery with this secret using HMAC-SHA256 and includes the signature in the `X-Hub-Signature-256` header. probot-go rejects any request whose signature does not match.
+
+  Defaults to `"development"` when not set — which matches GitHub's default suggestion during local setup.
+
+  ```go
+  Secret: os.Getenv("WEBHOOK_SECRET"),
+  ```
+</ParamField>
+
+<ParamField body="GithubToken" type="string">
+  A personal access token (PAT) or installation token. Use this as an alternative to `AppID` + `PrivateKey` for simple single-repository integrations where you do not need per-installation scoping. When set, no JWT authentication is performed.
+
+  ```go
+  GithubToken: os.Getenv("GITHUB_TOKEN"),
+  ```
+</ParamField>
+
+### Logging Fields
+
+<ParamField body="LogLevel" type="string" default="info">
+  Minimum log level for the structured zerolog logger. Accepted values (from most to least verbose):
+
+  `trace` | `debug` | `info` | `warn` | `error` | `fatal` | `panic`
+
+  ```go
+  LogLevel: "debug",
+  ```
+</ParamField>
+
+<ParamField body="LogFormat" type="string" default="pretty">
+  Controls the log output format:
+
+  - `"pretty"` — human-readable, coloured output for terminals.
+  - `"json"` — newline-delimited JSON, suitable for log aggregators (e.g. Datadog, Loki).
+
+  ```go
+  LogFormat: "json",
+  ```
+</ParamField>
+
+### Server Fields
+
+<ParamField body="Port" type="int" default="3000">
+  TCP port the HTTP server listens on. Used by `probot.NewServer()` when no override is provided in `ServerOptions`.
+
+  ```go
+  Port: 8080,
+  ```
+</ParamField>
+
+<ParamField body="Host" type="string" default="localhost">
+  Hostname or IP address the HTTP server binds to. Use `"0.0.0.0"` to accept connections on all interfaces (required when running in a container or accepting traffic from a reverse proxy).
+
+  ```go
+  Host: "0.0.0.0",
+  ```
+</ParamField>
+
+<ParamField body="WebhookPath" type="string" default="/api/github/webhooks">
+  URL path the webhook handler is mounted on. This is the path you configure in your GitHub App's **Webhook URL** field (after your public hostname).
+
+  ```go
+  WebhookPath: "/hooks",
+  ```
+</ParamField>
+
+<ParamField body="WebhookProxyURL" type="string">
+  URL of a Smee.io (or compatible SSE-based) webhook proxy channel. When set, probot-go's server starts a long-lived SSE client that relays events from the proxy to the local webhook handler — useful during development when `localhost` is not publicly reachable.
+
+  ```go
+  WebhookProxyURL: "https://smee.io/your-channel-id",
+  ```
+</ParamField>
+
+<ParamField body="RequestTimeout" type="time.Duration" default="30s">
+  Maximum duration for each outbound GitHub API request made through the `go-github` client. Applies to all authenticated clients created by this Probot instance.
+
+  ```go
+  RequestTimeout: 10 * time.Second,
+  ```
+</ParamField>
+
+### Enterprise Server Field
+
+<ParamField body="BaseURL" type="string">
+  Override the GitHub API base URL. Required when targeting a GitHub Enterprise Server (GHES) instance. The value should be the full REST API root, for example `"https://github.example.com/api/v3"`.
+
+  When using `OptionsFromEnv()`, set the `GHE_HOST` environment variable (just the hostname) and the `https://` prefix and `/api/v3` suffix are added automatically.
+
+  ```go
+  BaseURL: "https://github.example.com/api/v3",
+  ```
+</ParamField>
+
+---
+
+## Environment Variables
+
+`OptionsFromEnv()` maps well-known environment variable names to `Options` fields. Every variable is also recognised with a `PROBOT_` prefix (e.g. `PROBOT_APP_ID`), which takes precedence over the bare name — useful when running multiple apps in the same environment.
+
+```go
+opts, err := probot.OptionsFromEnv()
+if err != nil {
+    log.Fatal().Err(err).Msg("invalid options from environment")
+}
+app, err := probot.New(opts)
+```
+
+| Environment Variable | Options Field | Notes |
+|---|---|---|
+| `APP_ID` | `AppID` | Numeric App ID as a string |
+| `PRIVATE_KEY` | `PrivateKey` | Full PEM contents |
+| `PRIVATE_KEY_PATH` | `PrivateKey` | Path to a `.pem` file; file is read automatically |
+| `WEBHOOK_SECRET` | `Secret` | HMAC webhook secret |
+| `GITHUB_TOKEN` | `GithubToken` | PAT alternative to App auth |
+| `LOG_LEVEL` | `LogLevel` | `trace`…`panic` |
+| `LOG_FORMAT` | `LogFormat` | `pretty` or `json` |
+| `PORT` | `Port` | Parsed as integer |
+| `HOST` | `Host` | Bind address |
+| `GHE_HOST` | `BaseURL` | Hostname only; `/api/v3` path is appended |
+| `WEBHOOK_PATH` | `WebhookPath` | Mount path |
+| `WEBHOOK_PROXY_URL` | `WebhookProxyURL` | Smee.io or compatible SSE proxy URL |
+
+<Note>
+  `PRIVATE_KEY_PATH` is only used when `PRIVATE_KEY` (and `PROBOT_PRIVATE_KEY`) are both unset. If both are present, `PRIVATE_KEY` takes precedence.
+</Note>
+
+<Note>
+  `GHE_HOST` accepts only the hostname (e.g. `github.example.com`). `OptionsFromEnv` constructs the full `BaseURL` as `"https://" + GHE_HOST + "/api/v3"`.
+</Note>
+
+### PROBOT_ Prefix
+
+Every variable above is also read from a `PROBOT_`-prefixed variant, which takes precedence:
+
+```bash
+# Equivalent to APP_ID=123456 but takes priority if both are set
+PROBOT_APP_ID=123456
+```
+
+This allows you to scope probot-go credentials separately from other tools in the same shell environment.
+
+---
+
+## Defaults Functional Option
+
+`probot.Defaults(o Options)` returns a `func(*Options)` that you can pass as the second argument to `probot.New()`. It pre-applies a base set of options, but any field set directly in the first argument always wins.
+
+This is the Go equivalent of probot's `app.defaults()` pattern and is useful when you want to centralise shared configuration (for example, a common log level and host) while allowing call-site overrides.
+
+```go
+baseDefaults := probot.Defaults(probot.Options{
+    LogLevel: "debug",
+    LogFormat: "json",
+    Host:     "0.0.0.0",
+    Port:     8080,
+})
+
+// LogLevel and Host come from baseDefaults; AppID/PrivateKey/Secret are explicit.
+app, err := probot.New(
+    probot.Options{
+        AppID:      os.Getenv("APP_ID"),
+        PrivateKey: os.Getenv("PRIVATE_KEY"),
+        Secret:     os.Getenv("WEBHOOK_SECRET"),
+    },
+    baseDefaults,
+)
+```
+
+Multiple defaults functions can be passed; they are applied in order, and each one only fills zero-valued fields:
+
+```go
+app, err := probot.New(opts, defaultsA, defaultsB)
+```
+
+<Tip>
+  `Defaults()` only fills zero-valued fields. A zero `int` for `Port`, an empty `string` for `Host`, etc. will be overwritten. Fields that already carry a value are never touched.
+</Tip>
+
+---
+
+## LoadEnvFile
+
+`probot.LoadEnvFile(path string) error` parses a `.env`-style file and sets any key that is not already present in the process environment. It is deliberately non-destructive: running it after credentials have been injected by a CI system (e.g. GitHub Actions secrets) will not overwrite them.
+
+### Format
+
+```bash
+# Lines starting with # are ignored
+APP_ID=123456
+WEBHOOK_SECRET=development
+
+# Optional: export prefix is stripped
+export LOG_LEVEL=debug
+
+# Single-quoted values are literal (no escape processing)
+HOST='localhost'
+
+# Double-quoted values expand escape sequences
+PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
+```
+
+### Quoting rules
+
+| Style | Example | Behaviour |
+|---|---|---|
+| Unquoted | `HOST=localhost` | Value taken as-is |
+| Single-quoted | `HOST='localhost'` | Literal — no escape processing |
+| Double-quoted | `PRIVATE_KEY="-----\nMIIE...\n-----"` | Escape sequences (`\n`, `\r`, `\t`, `\"`, `\\`) are expanded |
+
+The double-quote expansion is specifically designed for the PEM private key written by the setup wizard, which stores newlines as `\n` on a single line.
+
+### Usage
+
+```go
+// Load .env before calling OptionsFromEnv so the env vars are available.
+if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+    log.Warn().Err(err).Msg("failed to load .env")
+}
+
+opts, err := probot.OptionsFromEnv()
+```
+
+<Warning>
+  `LoadEnvFile` returns an error if the file exists but cannot be read (e.g. permission denied). A missing file (`os.IsNotExist(err) == true`) is not an error condition in production — check for it explicitly if the `.env` file is optional.
+</Warning>
+
+---
+
+## OptionsFromEnv
+
+`probot.OptionsFromEnv() (Options, error)` is a convenience function that calls `os.Getenv` (with `PROBOT_` prefix fallback) for every supported variable and returns a populated `Options` value. It returns an error only if `PORT` is set to a non-integer value or if `PRIVATE_KEY_PATH` is set but the file cannot be read.
+
+```go
+opts, err := probot.OptionsFromEnv()
+if err != nil {
+    log.Fatal().Err(err).Msg("invalid options from environment")
+}
+
+// You can still override individual fields after loading from env.
+opts.Host = "0.0.0.0"
+
+app, err := probot.New(opts)
+```
+
+### Typical setup pattern
+
+The recommended pattern used in the [basic example](https://github.com/Pratyay360/probot-go/tree/main/example/basic) is to load a `.env` file first, then call `OptionsFromEnv()`, then override any fields that should always be set programmatically:
+
+```go
+func main() {
+    // 1. Populate env from .env file (skips existing vars).
+    if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+        log.Warn().Err(err).Msg("failed to load .env")
+    }
+
+    // 2. Build Options from the environment.
+    opts, err := probot.OptionsFromEnv()
+    if err != nil {
+        log.Fatal().Err(err).Msg("invalid options")
+    }
+
+    // 3. Apply any hard-coded overrides.
+    opts.Host = "localhost"
+
+    // 4. Create the Probot instance.
+    app, err := probot.New(opts)
+    if err != nil {
+        log.Fatal().Err(err).Msg("failed to create probot")
+    }
+
+    // … register handlers …
+
+    probot.NewServer(probot.ServerOptions{Probot: app}).Start()
+}
+```
+
+---
+
+## Complete Options Reference
+
+```go
+type Options struct {
+    // Authentication — one group required.
+    AppID       string        // GitHub App numeric ID (string)
+    PrivateKey  string        // PEM contents of App private key
+    Secret      string        // Webhook HMAC secret; default "development"
+    GithubToken string        // PAT alternative to AppID + PrivateKey
+
+    // Logging
+    LogLevel  string // trace|debug|info|warn|error|fatal|panic; default "info"
+    LogFormat string // "pretty" or "json"; default "pretty"
+
+    // HTTP server
+    Port            int           // default 3000
+    Host            string        // default "localhost"
+    WebhookPath     string        // default "/api/github/webhooks"
+    WebhookProxyURL string        // Smee.io SSE proxy URL (optional)
+    RequestTimeout  time.Duration // default 30s
+
+    // GitHub Enterprise Server
+    BaseURL string // e.g. "https://github.example.com/api/v3"
+}
+```

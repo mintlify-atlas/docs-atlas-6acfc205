@@ -1,0 +1,235 @@
+---
+title: "Options, OptionsFromEnv, and LoadEnvFile Reference"
+sidebarTitle: "Options"
+description: "Complete reference for probot-go's Options struct, all fields and defaults, OptionsFromEnv environment variable mapping, Defaults functional option, and LoadEnvFile."
+---
+
+`Options` is the single configuration object passed to `New`. Every field has a sensible default applied by `applyDefaults` before validation, so a minimal production configuration only needs `AppID` plus `PrivateKey`, or a `GithubToken`. `OptionsFromEnv` reads all fields from the process environment, and `LoadEnvFile` populates that environment from a `.env` style file before `OptionsFromEnv` is called.
+
+## Import
+
+```go
+import probot "github.com/Pratyay360/probot-go"
+```
+
+---
+
+## Options Struct
+
+```go
+type Options struct {
+    AppID           string
+    PrivateKey      string
+    Secret          string
+    GithubToken     string
+    LogLevel        string
+    LogFormat       string
+    Port            int
+    Host            string
+    BaseURL         string
+    WebhookPath     string
+    WebhookProxyURL string
+    RequestTimeout  time.Duration
+}
+```
+
+<ResponseField name="AppID" type="string">
+  The numeric ID of the GitHub App, expressed as a string (e.g. `"12345"`).
+  Required unless `GithubToken` is set. Mutually dependent with `PrivateKey` —
+  both must be set or neither.
+</ResponseField>
+
+<ResponseField name="PrivateKey" type="string">
+  The **full PEM contents** of the private key downloaded from the GitHub App
+  settings page (not a file path). Required unless `GithubToken` is set.
+  `OptionsFromEnv` resolves `PRIVATE_KEY_PATH` and reads the file for you.
+</ResponseField>
+
+<ResponseField name="Secret" type="string" default="development">
+  The webhook secret used to verify the `X-Hub-Signature-256` header on
+  incoming payloads. Defaults to `"development"` when empty. Use a strong
+  random value in production and keep it in sync with the value configured in
+  your GitHub App settings.
+</ResponseField>
+
+<ResponseField name="GithubToken" type="string">
+  A personal access token or installation token. Provide this **instead of**
+  `AppID` + `PrivateKey` for simple single-repository integrations or local
+  development. When set, all GitHub API calls use this static bearer token.
+</ResponseField>
+
+<ResponseField name="LogLevel" type="string" default="info">
+  Minimum log level. Accepted values: `trace`, `debug`, `info`, `warn` (or
+  `warning`), `error`, `fatal`, `panic`, `disabled`. Any unrecognised value
+  falls back to `info`.
+</ResponseField>
+
+<ResponseField name="LogFormat" type="string" default="pretty">
+  Log output format. Use `"pretty"` for human-readable console output (with
+  coloured levels and timestamps) or `"json"` for newline-delimited JSON,
+  suitable for structured log ingestion pipelines.
+</ResponseField>
+
+<ResponseField name="Port" type="int" default="3000">
+  TCP port the HTTP server listens on. Only used by `Server`; ignored when you
+  mount `WebhookHandler` or `WebhookMiddleware` in your own server.
+</ResponseField>
+
+<ResponseField name="Host" type="string" default="localhost">
+  Hostname or IP address the HTTP server binds to. Only used by `Server`.
+  Change to `"0.0.0.0"` to accept connections on all interfaces.
+</ResponseField>
+
+<ResponseField name="BaseURL" type="string">
+  Override the GitHub API base URL for GitHub Enterprise Server, e.g.
+  `"https://github.example.com/api/v3"`. Leave empty for github.com.
+  `OptionsFromEnv` constructs this from `GHE_HOST` automatically.
+</ResponseField>
+
+<ResponseField name="WebhookPath" type="string" default="/api/github/webhooks">
+  URL path the webhook handler is mounted on. Must begin with `/`. Change this
+  if your reverse proxy exposes the webhook at a different path.
+</ResponseField>
+
+<ResponseField name="WebhookProxyURL" type="string">
+  URL of a webhook proxy service such as [Smee.io](https://smee.io) that
+  forwards events to localhost during development. When set, `Server.Start`
+  opens a persistent SSE connection to this URL and forwards events to the
+  local webhook handler. Leave empty in production.
+</ResponseField>
+
+<ResponseField name="RequestTimeout" type="time.Duration" default="30s">
+  Maximum duration for a single GitHub API HTTP request. Passed to the
+  `go-github` client via `github.WithTimeout`. Use `0` to disable the timeout
+  (not recommended).
+</ResponseField>
+
+---
+
+## Functions
+
+### `Defaults`
+
+```go
+func Defaults(o Options) func(*Options)
+```
+
+Returns a functional option that applies `o` as default values. When passed to
+`New` as a `defaults` argument, only zero-valued fields in the primary `Options`
+are filled in from `o`. Non-zero fields in the primary `Options` always take
+precedence.
+
+This is the idiomatic way to share a base configuration across multiple
+`Probot` instances in the same process, or to provide library-level defaults
+without preventing callers from overriding individual fields.
+
+```go
+base := probot.Defaults(probot.Options{
+    LogLevel:    "debug",
+    WebhookPath: "/hooks/github",
+})
+
+app, err := probot.New(probot.Options{AppID: "1", PrivateKey: key}, base)
+// app will use LogLevel "debug" and WebhookPath "/hooks/github"
+// because those fields were zero in the primary Options.
+```
+
+---
+
+### `OptionsFromEnv`
+
+```go
+func OptionsFromEnv() (Options, error)
+```
+
+Reads configuration from the process environment and returns a populated
+`Options`. All variables are also accepted with a `PROBOT_` prefix (e.g.
+`PROBOT_APP_ID`); the prefixed form takes precedence.
+
+Returns an error only for `PORT` containing a non-numeric value or
+`PRIVATE_KEY_PATH` pointing to an unreadable file.
+
+<Note>
+  Call `LoadEnvFile` before `OptionsFromEnv` when you store credentials in a
+  `.env` file — `OptionsFromEnv` reads the process environment, not files.
+</Note>
+
+```go
+if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+    log.Fatal(err)
+}
+opts, err := probot.OptionsFromEnv()
+if err != nil {
+    log.Fatal(err)
+}
+app, err := probot.New(opts)
+```
+
+#### Environment Variable Mapping
+
+| Environment variable | `Options` field | Notes |
+|---|---|---|
+| `APP_ID` | `AppID` | Also `PROBOT_APP_ID` |
+| `PRIVATE_KEY` | `PrivateKey` | Full PEM string. Also `PROBOT_PRIVATE_KEY` |
+| `PRIVATE_KEY_PATH` | `PrivateKey` | File is read; takes effect only when `PRIVATE_KEY` is unset |
+| `WEBHOOK_SECRET` | `Secret` | Also `PROBOT_WEBHOOK_SECRET` |
+| `GITHUB_TOKEN` | `GithubToken` | Also `PROBOT_GITHUB_TOKEN` |
+| `LOG_LEVEL` | `LogLevel` | Also `PROBOT_LOG_LEVEL` |
+| `LOG_FORMAT` | `LogFormat` | Also `PROBOT_LOG_FORMAT` |
+| `PORT` | `Port` | Parsed as decimal integer. Also `PROBOT_PORT` |
+| `HOST` | `Host` | Also `PROBOT_HOST` |
+| `GHE_HOST` | `BaseURL` | Constructs `https://<GHE_HOST>/api/v3`. Also `PROBOT_GHE_HOST` |
+| `WEBHOOK_PATH` | `WebhookPath` | Also `PROBOT_WEBHOOK_PATH` |
+| `WEBHOOK_PROXY_URL` | `WebhookProxyURL` | Also `PROBOT_WEBHOOK_PROXY_URL` |
+
+---
+
+### `LoadEnvFile`
+
+```go
+func LoadEnvFile(path string) error
+```
+
+Parses a `.env`-style file at `path` and sets any key it finds into the process
+environment via `os.Setenv`. Variables that are already set in the environment
+are **not overridden**, so the real environment always wins over the file.
+
+<ParamField path="path" type="string" required>
+  Path to the `.env` file, e.g. `".env"` or `"/etc/myapp/.env"`.
+</ParamField>
+
+**Returns** `error` when the file cannot be read. A missing file is surfaced as
+a standard `os.ErrNotExist` error, so callers can use `os.IsNotExist` to treat
+that case as a no-op.
+
+#### File format
+
+- Lines beginning with `#` are comments and are skipped.
+- `export KEY=VALUE` is accepted (the `export` keyword is stripped).
+- Values may be **bare**, **single-quoted** (`'...'`), or **double-quoted** (`"..."`).
+- Double-quoted values have escape sequences expanded (`\n`, `\r`, `\t`,
+  `\"`, `\\`), which is how the setup wizard stores multi-line PEM private keys
+  on a single line.
+
+```bash
+# .env
+APP_ID=12345
+WEBHOOK_SECRET=supersecret
+# Multi-line PEM on one line using escape sequences:
+PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
+LOG_LEVEL=debug
+PORT=8080
+```
+
+```go
+if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+    log.Fatalf("loading .env: %v", err)
+}
+opts, _ := probot.OptionsFromEnv()
+```
+
+<Warning>
+  `LoadEnvFile` writes into the process environment with `os.Setenv`. This
+  affects all goroutines. Call it early in `main`, before spawning any
+  goroutines that read environment variables.
+</Warning>

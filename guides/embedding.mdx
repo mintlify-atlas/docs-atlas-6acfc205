@@ -1,0 +1,191 @@
+---
+title: "Embed probot-go into an Existing HTTP Server"
+sidebarTitle: "Embedding"
+description: "Mount probot-go's webhook handling inside any net/http server using WebhookMiddleware, WebhookHandler, or Handler — no dedicated server required."
+---
+
+If you already have a running Go HTTP server — an API, a dashboard, or any `net/http`-compatible router — you can add GitHub App webhook handling to it without adopting `probot.NewServer`. Three helpers let you choose exactly how tightly you want to integrate: a middleware wrapper, a bare `http.HandlerFunc`, or a combined handler that merges both worlds.
+
+## Integration Helpers
+
+### WebhookMiddleware
+
+`WebhookMiddleware()` returns a standard `func(http.Handler) http.Handler` middleware. It intercepts requests whose path exactly matches `p.opts.WebhookPath` and dispatches them through probot-go's validation and routing pipeline. Every other request is forwarded unchanged to the `next` handler.
+
+```go
+func (p *Probot) WebhookMiddleware() func(http.Handler) http.Handler
+```
+
+This is the idiomatic choice when you use a middleware-centric router such as [chi](https://github.com/go-chi/chi).
+
+### WebhookHandler
+
+`WebhookHandler()` returns an `http.HandlerFunc` you can register directly on any mux. Use it when you want explicit control over which path triggers webhook processing.
+
+```go
+func (p *Probot) WebhookHandler() http.HandlerFunc
+```
+
+### Handler
+
+`Handler()` is a convenience wrapper that combines both concerns in one call. Requests to `p.opts.WebhookPath` go to the webhook handler; everything else goes to the optional `next` handler (or returns 404 if none is provided).
+
+```go
+func (p *Probot) Handler(next ...http.Handler) http.Handler
+```
+
+## Usage Examples
+
+<Tabs>
+  <Tab title="net/http ServeMux">
+    Register `WebhookHandler` on an explicit path using the standard library mux:
+
+    ```go
+    package main
+
+    import (
+        "net/http"
+
+        probot "github.com/Pratyay360/probot-go"
+    )
+
+    func main() {
+        app, _ := probot.New(probot.Options{
+            AppID:      "123456",
+            PrivateKey: "...",
+            Secret:     "my-secret",
+        })
+
+        app.On("issues.opened", func(ctx *probot.Context) error {
+            ctx.Log().Info().Msg("issue opened")
+            return nil
+        })
+
+        mux := http.NewServeMux()
+
+        // Mount the webhook handler at the probot-go default path.
+        mux.Handle(app.WebhookPath(), app.WebhookHandler())
+
+        // Your existing routes continue to work normally.
+        mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+            w.WriteHeader(http.StatusOK)
+        })
+
+        http.ListenAndServe(":8080", mux)
+    }
+    ```
+  </Tab>
+  <Tab title="chi middleware">
+    Apply `WebhookMiddleware` at the router level so it runs before any route matching:
+
+    ```go
+    package main
+
+    import (
+        "net/http"
+
+        "github.com/go-chi/chi/v5"
+        probot "github.com/Pratyay360/probot-go"
+    )
+
+    func main() {
+        app, _ := probot.New(probot.Options{
+            AppID:      "123456",
+            PrivateKey: "...",
+            Secret:     "my-secret",
+        })
+
+        app.On("pull_request.opened", func(ctx *probot.Context) error {
+            ctx.Log().Info().Msg("pull request opened")
+            return nil
+        })
+
+        r := chi.NewRouter()
+
+        // Webhook middleware intercepts requests to WebhookPath;
+        // all other traffic falls through to chi's own routing.
+        r.Use(app.WebhookMiddleware())
+
+        r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+            w.Write([]byte("my app"))
+        })
+
+        http.ListenAndServe(":8080", r)
+    }
+    ```
+  </Tab>
+  <Tab title="Handler() wrapper">
+    Use `Handler()` when you want probot-go to own the top-level mux while still forwarding non-webhook traffic to your application:
+
+    ```go
+    package main
+
+    import (
+        "net/http"
+
+        probot "github.com/Pratyay360/probot-go"
+    )
+
+    func main() {
+        app, _ := probot.New(probot.Options{
+            AppID:      "123456",
+            PrivateKey: "...",
+            Secret:     "my-secret",
+        })
+
+        app.On("push", func(ctx *probot.Context) error {
+            ctx.Log().Info().Msg("push event received")
+            return nil
+        })
+
+        // Build your own application mux.
+        appMux := http.NewServeMux()
+        appMux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+            w.Write([]byte("ok"))
+        })
+
+        // app.Handler routes WebhookPath to probot-go and everything
+        // else to appMux.
+        http.ListenAndServe(":8080", app.Handler(appMux))
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Choosing the Right Helper
+
+<CardGroup cols={3}>
+  <Card title="WebhookMiddleware" icon="layers">
+    Best for middleware-centric routers (chi, gorilla/mux). Slots naturally into an existing `Use()` chain without touching your route definitions.
+  </Card>
+  <Card title="WebhookHandler" icon="route">
+    Best for `http.ServeMux` or any router where you register handlers by path. Gives you explicit control over the mount point.
+  </Card>
+  <Card title="Handler" icon="merge">
+    Best when probot-go sits at the top level and delegates to the rest of your app. Minimal setup, no separate mux required.
+  </Card>
+</CardGroup>
+
+<Note>
+  All three helpers verify the `X-Hub-Signature-256` header on every incoming request using the `Secret` configured in `Options`. Requests with a missing or invalid signature receive an HTTP 401 response and are never dispatched to your handlers.
+</Note>
+
+## Webhook Path Configuration
+
+The default webhook path is `/api/github/webhooks`. Override it via `Options.WebhookPath` or the `WEBHOOK_PATH` environment variable:
+
+```go
+app, _ := probot.New(probot.Options{
+    AppID:       "123456",
+    PrivateKey:  "...",
+    Secret:      "my-secret",
+    WebhookPath: "/webhooks/github",
+})
+
+mux := http.NewServeMux()
+mux.Handle(app.WebhookPath(), app.WebhookHandler())
+```
+
+<Tip>
+  `app.WebhookPath()` always returns the effective path (built-in default or override), so use it instead of hard-coding the string to keep your registration and your `Options` in sync.
+</Tip>

@@ -1,0 +1,106 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "probot-go",
+  "projectDescription": "A Go port of Probot — a framework for building GitHub Apps with built-in webhook validation, auto-refreshing installation auth, and an event-driven handler API.",
+  "theme": "luma",
+  "primaryColor": "#ffae04",
+  "lightColor": "#000000",
+  "darkColor": "#fcfcfc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/event-handling",
+              "concepts/context",
+              "concepts/authentication"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/server-setup",
+              "guides/embedding",
+              "guides/github-actions",
+              "guides/repo-config",
+              "guides/testing",
+              "guides/github-enterprise"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API",
+            "pages": [
+              "api/probot",
+              "api/context",
+              "api/options",
+              "api/server",
+              "api/webhook"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "HMAC SHA-256 webhook signature verification built-in",
+    "Auto-refreshing GitHub App installation tokens via ghinstallation",
+    "Pre-authenticated go-github client available in every handler context",
+    "Event-driven handler API: On, OnMany, OnAny, OnError",
+    "One-click GitHub App registration via manifest flow setup wizard",
+    "Repo-level YAML/JSON config loading with _extends inheritance",
+    "Embeddable as net/http middleware in existing servers",
+    "GitHub Actions support via RunAction()",
+    "Webhook proxy (Smee.io) client for local development",
+    "Environment variable and .env file configuration helpers"
+  ],
+  "publicApiSurface": [
+    "probot.New(o Options, defaults ...func(*Options)) (*Probot, error)",
+    "probot.Defaults(o Options) func(*Options)",
+    "probot.OptionsFromEnv() (Options, error)",
+    "probot.LoadEnvFile(path string) error",
+    "(*Probot).On(eventName string, fn HandlerFunc)",
+    "(*Probot).OnMany(eventNames []string, fn HandlerFunc)",
+    "(*Probot).OnAny(fn HandlerFunc)",
+    "(*Probot).OnError(fn ErrorHandlerFunc)",
+    "(*Probot).Load(fns ...ApplicationFunc) error",
+    "(*Probot).Auth(installationID ...int64) (*github.Client, error)",
+    "(*Probot).Receive(event WebhookEvent) error",
+    "(*Probot).RunAction() error",
+    "(*Probot).WebhookHandler() http.HandlerFunc",
+    "(*Probot).WebhookMiddleware() func(http.Handler) http.Handler",
+    "(*Probot).Handler(next ...http.Handler) http.Handler",
+    "probot.NewServer(o ServerOptions) *Server",
+    "(*Server).Start() error",
+    "(*Server).Stop() error",
+    "(*Server).Handler() http.Handler",
+    "(*Context).GitHub() *github.Client",
+    "(*Context).Octokit() *github.Client",
+    "(*Context).Issue() (IssueParams, error)",
+    "(*Context).Repo() (Repo, error)",
+    "(*Context).PullRequest() (PullRequestParams, error)",
+    "(*Context).Config(fileName string, defaults ...map[string]any) (map[string]any, error)",
+    "(*Context).ParseInto(v any) error",
+    "(*Context).Payload() map[string]any",
+    "(*Context).Log() zerolog.Logger",
+    "(*Context).IsBot() bool",
+    "(*Context).Name() string",
+    "(*Context).ID() string",
+    "probot.VerifyGitHubSignature(secret, payload, signature string) error"
+  ]
+}

@@ -1,0 +1,365 @@
+---
+title: "Context Type: Handler Helpers and GitHub Client"
+sidebarTitle: "Context"
+description: "Reference for probot-go's Context type: Name, ID, Payload, GitHub client, Repo/Issue/PullRequest extractors, Config loader, and structured logging."
+---
+
+Every webhook handler receives a `*Context` as its sole argument. The context wraps the raw delivery — its event name, unique delivery ID, and parsed JSON payload — and adds an authenticated `*github.Client` scoped to the installation that sent the event, convenience methods for extracting repository and issue coordinates, and a structured logger pre-tagged with the event name and delivery ID.
+
+## Import
+
+```go
+import probot "github.com/Pratyay360/probot-go"
+```
+
+---
+
+## Supporting Types
+
+These types are returned by `Context` helper methods and are ready to pass directly to the corresponding go-github API calls.
+
+```go
+// Repo identifies a GitHub repository by owner login and repository name.
+type Repo struct {
+    Owner string
+    Repo  string
+}
+
+// IssueParams identifies an issue or pull request for go-github API calls.
+type IssueParams struct {
+    Owner  string
+    Repo   string
+    Number int
+}
+
+// PullRequestParams is an alias for IssueParams. Pull requests and issues
+// share the same numeric identifier in the GitHub API.
+type PullRequestParams = IssueParams
+```
+
+<ResponseField name="Repo" type="struct">
+  <Expandable title="fields">
+    <ResponseField name="Owner" type="string">
+      The GitHub login of the repository owner (user or organization).
+    </ResponseField>
+    <ResponseField name="Repo" type="string">
+      The repository name, without the owner prefix.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="IssueParams" type="struct">
+  <Expandable title="fields">
+    <ResponseField name="Owner" type="string">
+      Repository owner login.
+    </ResponseField>
+    <ResponseField name="Repo" type="string">
+      Repository name.
+    </ResponseField>
+    <ResponseField name="Number" type="int">
+      Issue or pull request number.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="PullRequestParams" type="= IssueParams">
+  Type alias for `IssueParams`. Use either name interchangeably when working
+  with pull requests.
+</ResponseField>
+
+---
+
+## Identity Methods
+
+### `Name`
+
+```go
+func (c *Context) Name() string
+```
+
+Returns the top-level webhook event name as sent in the `X-GitHub-Event`
+header — for example `"issues"`, `"push"`, or `"pull_request"`. This is always
+the bare event name without an action suffix.
+
+```go
+app.OnAny(func(ctx *probot.Context) error {
+    fmt.Println(ctx.Name()) // e.g. "issues"
+    return nil
+})
+```
+
+---
+
+### `ID`
+
+```go
+func (c *Context) ID() string
+```
+
+Returns the unique delivery ID GitHub assigned to this webhook delivery,
+sourced from the `X-GitHub-Delivery` request header. When the header is absent
+(e.g. when dispatched via `RunAction`), the value is `"action"` or the
+`GITHUB_RUN_ID` environment variable.
+
+---
+
+## Payload Access
+
+### `Payload`
+
+```go
+func (c *Context) Payload() map[string]any
+```
+
+Returns the raw webhook JSON payload as a `map[string]any`. Keys match the
+GitHub webhook payload schema exactly. Prefer `ParseInto` when you have a typed
+struct for the event.
+
+```go
+action, _ := ctx.Payload()["action"].(string) // e.g. "opened"
+```
+
+---
+
+### `ParseInto`
+
+```go
+func (c *Context) ParseInto(v any) error
+```
+
+Unmarshals the webhook payload into the typed struct pointed to by `v`. Under
+the hood the payload map is re-serialised to JSON and then decoded into `v`,
+so all standard `encoding/json` struct tags apply.
+
+<ParamField path="v" type="any" required>
+  A pointer to a struct that matches the shape of the GitHub webhook payload for
+  this event, e.g. `*github.IssuesEvent` from `github.com/google/go-github`.
+</ParamField>
+
+```go
+app.On("issues", func(ctx *probot.Context) error {
+    var ev github.IssuesEvent
+    if err := ctx.ParseInto(&ev); err != nil {
+        return err
+    }
+    fmt.Println(ev.GetAction()) // "opened", "closed", etc.
+    return nil
+})
+```
+
+---
+
+## GitHub Client
+
+### `GitHub`
+
+```go
+func (c *Context) GitHub() *github.Client
+```
+
+Returns the `*github.Client` (from `github.com/google/go-github/v88/github`)
+authenticated for the installation that triggered this event. The client is
+built from `payload.installation.id`; when no installation is present in the
+payload it falls back to the app-level client.
+
+<Tip>
+  Use `ctx.GitHub()` (or the equivalent `ctx.Octokit()`) instead of
+  `app.Auth(installationID)` inside handlers — the correct installation client
+  is already resolved for you.
+</Tip>
+
+```go
+app.On("issues.opened", func(ctx *probot.Context) error {
+    issue, _ := ctx.Issue()
+    _, _, err := ctx.GitHub().Issues.CreateComment(
+        context.Background(),
+        issue.Owner,
+        issue.Repo,
+        issue.Number,
+        &github.IssueComment{Body: github.String("Thanks for opening this issue!")},
+    )
+    return err
+})
+```
+
+---
+
+### `Octokit`
+
+```go
+func (c *Context) Octokit() *github.Client
+```
+
+Alias for `GitHub()`. Mirrors the `context.octokit` property in the Node.js
+probot library so that code translated from JavaScript reads naturally.
+
+---
+
+## Logging
+
+### `Log`
+
+```go
+func (c *Context) Log() zerolog.Logger
+```
+
+Returns a `zerolog.Logger` pre-populated with `event` and `delivery_id` fields
+for this delivery. Use it inside handlers to produce structured log lines that
+are automatically correlated with the incoming event.
+
+```go
+app.On("push", func(ctx *probot.Context) error {
+    ctx.Log().Info().Msg("handling push")
+    // logs: {"level":"info","event":"push","delivery_id":"abc-123","message":"handling push"}
+    return nil
+})
+```
+
+---
+
+## Bot Detection
+
+### `IsBot`
+
+```go
+func (c *Context) IsBot() bool
+```
+
+Returns `true` when `payload["sender"]["type"]` equals `"Bot"`. Use this guard
+at the top of handlers that post comments or create issues, to avoid
+infinite feedback loops when your app reacts to its own activity.
+
+```go
+app.On("issue_comment.created", func(ctx *probot.Context) error {
+    if ctx.IsBot() {
+        return nil // ignore our own comments
+    }
+    // ... respond
+    return nil
+})
+```
+
+---
+
+## Repository & Issue Extractors
+
+### `Repo`
+
+```go
+func (c *Context) Repo() (Repo, error)
+```
+
+Extracts the repository owner login and repository name from
+`payload["repository"]`. Returns an error if the `repository` key is absent,
+which is expected for organisation-level or app-level events such as
+`installation` or `marketplace_purchase`.
+
+```go
+repo, err := ctx.Repo()
+if err != nil {
+    return err // org-level event — no repo
+}
+fmt.Printf("%s/%s\n", repo.Owner, repo.Repo)
+```
+
+---
+
+### `Issue`
+
+```go
+func (c *Context) Issue() (IssueParams, error)
+```
+
+Resolves the issue number from `payload["issue"]["number"]`, falling back to
+`payload["pull_request"]["number"]` when the `issue` key is absent. Also
+resolves `Owner` and `Repo` via `Repo()`. Returns an error if no repository is
+present in the payload.
+
+The returned `IssueParams` is ready to use with go-github methods such as
+`client.Issues.Get(ctx, params.Owner, params.Repo, params.Number, nil)`.
+
+---
+
+### `PullRequest`
+
+```go
+func (c *Context) PullRequest() (PullRequestParams, error)
+```
+
+Resolves the pull request number from `payload["pull_request"]["number"]`,
+falling back to `payload["issue"]["number"]`. Also resolves `Owner` and `Repo`
+via `Repo()`. Returns an error if no repository is present in the payload.
+
+`PullRequestParams` is a type alias for `IssueParams`, so all go-github PR
+methods accept it directly.
+
+```go
+app.On("pull_request.opened", func(ctx *probot.Context) error {
+    pr, err := ctx.PullRequest()
+    if err != nil {
+        return err
+    }
+    ctx.Log().Info().
+        Int("number", pr.Number).
+        Str("repo", pr.Repo).
+        Msg("PR opened")
+    return nil
+})
+```
+
+---
+
+## Configuration Loading
+
+### `Config`
+
+```go
+func (c *Context) Config(fileName string, defaultConfig ...map[string]any) (map[string]any, error)
+```
+
+Fetches a YAML or JSON configuration file from the `.github/` directory of the
+repository's default branch via the GitHub API, then deep-merges it over any
+provided defaults.
+
+<ParamField path="fileName" type="string" required>
+  Name of the config file inside `.github/`, e.g. `"stale.yml"` or
+  `"mybot.json"`. The `.github/` prefix is added automatically.
+</ParamField>
+
+<ParamField path="defaultConfig" type="...map[string]any">
+  Optional baseline configuration. Keys present in the repository's config file
+  override the defaults; nested maps are merged recursively rather than replaced.
+</ParamField>
+
+**Returns** `(map[string]any, error)`.
+
+- Returns `nil, nil` if the file does not exist **and** no defaults were provided.
+- Returns the deep-merged map if the file exists or defaults were provided.
+- Returns an error if the GitHub API call fails (for non-404 errors).
+
+#### `_extends` support
+
+If the loaded file contains a top-level `_extends` key with a value of the
+form `"owner/repo"`, `Config` fetches the same `fileName` from that repository
+and uses it as the base, then deep-merges the local file on top. This mirrors
+the behaviour of the Node.js probot `config` plugin.
+
+```go
+defaults := map[string]any{
+    "perform": false,
+    "daysUntilStale": 60,
+}
+
+cfg, err := ctx.Config("stale.yml", defaults)
+if err != nil {
+    return err
+}
+
+perform, _ := cfg["perform"].(bool)
+```
+
+<Note>
+  `Config` uses the installation-scoped `GitHub()` client, so the app must
+  have read access to the `contents` of the repository (and to any repository
+  referenced by `_extends`).
+</Note>

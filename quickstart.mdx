@@ -1,47 +1,271 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with probot-go in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install probot-go, handle your first GitHub webhook event, and run a working GitHub App bot in Go in five steps."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you from an empty directory to a running GitHub App that replies to opened issues. By the end you will have a bot listening on `localhost:3000`, validated against GitHub's HMAC signature, and posting comments via the `go-github` client.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+### Check prerequisites
+
+You need two things before writing any code:
+
+- **Go 1.21 or later** — verify with `go version`.
+- **A GitHub account** — you need permission to register a GitHub App (personal accounts work fine).
+
+<Note>
+  You do not need to pre-create the GitHub App. The probot-go setup wizard handles app registration for you when you first start the server.
+</Note>
+
+### Install probot-go
+
+Create a new module and add probot-go as a dependency:
+
+```bash
+mkdir my-bot && cd my-bot
+go mod init github.com/you/my-bot
+go get github.com/Pratyay360/probot-go
+```
+
+### Write main.go
+
+Create `main.go` with the following contents. This is a complete, runnable GitHub App — it loads credentials from a `.env` file or environment variables, posts a comment on every newly opened issue, logs every webhook event, and surfaces handler errors:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "os"
+
+    "github.com/google/go-github/v88/github"
+    "github.com/rs/zerolog/log"
+
+    probot "github.com/Pratyay360/probot-go"
+)
+
+func main() {
+    // Load .env if it exists; does not override existing env vars.
+    if err := probot.LoadEnvFile(".env"); err != nil && !os.IsNotExist(err) {
+        log.Warn().Err(err).Msg("failed to load .env")
+    }
+
+    // Build Options from environment variables.
+    opts, err := probot.OptionsFromEnv()
+    if err != nil {
+        log.Fatal().Err(err).Msg("invalid options from environment")
+    }
+
+    app, err := probot.New(opts)
+    if err != nil {
+        log.Fatal().Err(err).Msg("failed to create probot")
+    }
+
+    // Reply to every newly opened issue.
+    app.On("issues.opened", func(ctx *probot.Context) error {
+        issue, err := ctx.Issue()
+        if err != nil {
+            return err
+        }
+        _, _, err = ctx.GitHub().Issues.CreateComment(
+            context.Background(), issue.Owner, issue.Repo, issue.Number,
+            &github.IssueComment{Body: github.Ptr("Thanks for opening this issue!")},
+        )
+        return err
+    })
+
+    // Log every incoming event regardless of type.
+    app.OnAny(func(ctx *probot.Context) error {
+        ctx.Log().Info().
+            Str("name", ctx.Name()).
+            Str("delivery_id", ctx.ID()).
+            Msg("received webhook event")
+        return nil
+    })
+
+    // Surface errors from any handler to the structured logger.
+    app.OnError(func(ctx *probot.Context, err error) {
+        log.Error().Err(err).Str("event", ctx.Name()).Msg("webhook handler failed")
+    })
+
+    fmt.Printf("probot %s listening on http://%s:%d%s\n",
+        app.Version(), opts.Host, opts.Port, app.WebhookPath())
+
+    server := probot.NewServer(probot.ServerOptions{Probot: app})
+    if err := server.Start(); err != nil {
+        log.Fatal().Err(err).Msg("server failed")
+    }
+}
+```
+
+<Accordion title="Understanding the handler patterns">
+
+**`On(eventName, fn)`** — subscribes to a single event. The event name follows GitHub's `event` or `event.action` dot notation:
+
+```go
+// Matches any issues event (opened, closed, labeled, …)
+app.On("issues", handler)
+
+// Matches only issues.opened
+app.On("issues.opened", handler)
+
+// Matches pull_request.opened
+app.On("pull_request.opened", handler)
+```
+
+**`OnMany(eventNames, fn)`** — registers one handler for multiple events at once:
+
+```go
+app.OnMany([]string{"issues.closed", "pull_request.closed"}, func(ctx *probot.Context) error {
+    ctx.Log().Info().Str("event", ctx.Name()).Msg("something was closed")
+    return nil
+})
+```
+
+**`OnAny(fn)`** — called for every event, before type-specific handlers. Useful for audit logging:
+
+```go
+app.OnAny(func(ctx *probot.Context) error {
+    ctx.Log().Debug().Str("event", ctx.Name()).Msg("event received")
+    return nil
+})
+```
+
+**`OnError(fn)`** — receives any non-nil error returned by a handler. Replaces the default error log:
+
+```go
+app.OnError(func(ctx *probot.Context, err error) {
+    log.Error().Err(err).Str("event", ctx.Name()).Msg("handler failed")
+})
+```
+
+</Accordion>
+
+### Set environment variables
+
+probot-go reads credentials from the environment. You can either export them directly or write a `.env` file in the project root.
+
+<Tabs>
+  <Tab title="Shell export">
+    ```bash
+    export APP_ID=123456
+    export PRIVATE_KEY="$(cat /path/to/private-key.pem)"
+    export WEBHOOK_SECRET=your-secret
+    ```
+  </Tab>
+  <Tab title=".env file">
+    Create a file named `.env` in the same directory as `main.go`. The private key can span multiple lines inside double quotes — `LoadEnvFile` handles the escape sequences automatically:
 
     ```bash
-    npm install your-package
+    APP_ID=123456
+    WEBHOOK_SECRET=your-secret
+    # Single-line PEM (escape sequences expanded by LoadEnvFile)
+    PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
     ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+    Or point to a PEM file on disk with `PRIVATE_KEY_PATH`:
 
     ```bash
-    your-cli init
+    APP_ID=123456
+    WEBHOOK_SECRET=your-secret
+    PRIVATE_KEY_PATH=/path/to/github-app.pem
     ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+  </Tab>
+  <Tab title="PAT (simple repos)">
+    For single-repository scripts a personal access token can replace App auth entirely. No `APP_ID` or `PRIVATE_KEY` is needed:
 
     ```bash
-    your-cli start
+    export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
     ```
-  </Step>
-</Steps>
+  </Tab>
+</Tabs>
+
+<Warning>
+  Never commit `APP_ID`, `PRIVATE_KEY`, or `WEBHOOK_SECRET` to version control. Add `.env` to your `.gitignore`.
+</Warning>
+
+### Start the server
+
+```bash
+go run main.go
+```
+
+You should see output similar to:
+
+```
+probot 0.1.0 listening on http://localhost:3000/api/github/webhooks
+```
+
+**No credentials yet?** If none of the required environment variables are set, probot-go serves a setup wizard instead of crashing. Visit `http://localhost:3000` in your browser, fill in your app name and a publicly reachable webhook URL, and click **Register GitHub App**. GitHub redirects back to `/setup/callback`, where probot-go exchanges the manifest code for real credentials and writes them to `.env` — no restart required.
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+  During local development, use a tunnel such as [Smee.io](https://smee.io) to receive webhooks from GitHub. Set `WEBHOOK_PROXY_URL` to your Smee channel URL and probot-go's built-in proxy client will forward events automatically:
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  ```bash
+  export WEBHOOK_PROXY_URL=https://smee.io/your-channel-id
+  ```
 </Tip>
+
+### Install the app and send a test event
+
+1. Navigate to `https://github.com/settings/apps` → select your newly registered app → **Install App**.
+2. Choose a repository and click **Install**.
+3. Open a new issue in that repository.
+4. Watch the terminal — you should see the `issues.opened` handler fire and a comment appear on the issue.
+
+<CodeGroup>
+  ```go Simulate an event in tests
+  // Use Receive to inject a synthetic event without HTTP — handy for unit tests.
+  err := app.Receive(probot.WebhookEvent{
+      Name:    "issues",
+      ID:      "test-delivery-id",
+      Payload: map[string]any{
+          "action": "opened",
+          "issue":  map[string]any{"number": float64(1)},
+          "repository": map[string]any{
+              "name":  "my-repo",
+              "owner": map[string]any{"login": "my-org"},
+          },
+      },
+  })
+  ```
+
+  ```go Embed in an existing HTTP mux
+  // Mount only the webhook handler on your own mux — skip NewServer entirely.
+  mux := http.NewServeMux()
+  mux.Handle("/webhooks", app.WebhookHandler())
+  http.ListenAndServe(":8080", mux)
+  ```
+</CodeGroup>
+
+</Steps>
+
+## Running as a GitHub Action
+
+If you want to run the same app logic directly inside a GitHub Actions workflow, replace the `server.Start()` call with `app.RunAction()`. The function reads `GITHUB_EVENT_PATH` and `GITHUB_EVENT_NAME` from the Actions environment and dispatches the payload through your registered handlers, then returns.
+
+```go
+if os.Getenv("GITHUB_ACTIONS") == "true" {
+    if err := app.RunAction(); err != nil {
+        log.Fatal().Err(err).Msg("action failed")
+    }
+    return
+}
+
+// Normal server path for non-Actions environments.
+probot.NewServer(probot.ServerOptions{Probot: app}).Start()
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Full reference for Options fields, all supported environment variables, and .env file behaviour.
+  </Card>
+  <Card title="Core Concepts" icon="book-open" href="/concepts/event-handling">
+    Dig into Context helpers, repo config loading, and the authentication model.
+  </Card>
+</CardGroup>

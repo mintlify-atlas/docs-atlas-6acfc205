@@ -1,0 +1,246 @@
+---
+title: "Webhook Types: WebhookEvent, Signature Verification"
+sidebarTitle: "Webhook"
+description: "Reference for probot-go's WebhookEvent struct, VerifyGitHubSignature function, and the WebhookHandler, WebhookMiddleware, and Handler methods on Probot."
+---
+
+The webhook layer is responsible for receiving, authenticating, and dispatching GitHub webhook deliveries. It is composed of three pieces: the `WebhookEvent` value type that carries a parsed delivery through the pipeline, the `VerifyGitHubSignature` function that validates HMAC-SHA256 signatures, and the HTTP handler helpers on `Probot` that tie both together into a request handler you can mount in any `net/http`-compatible router.
+
+## Import
+
+```go
+import probot "github.com/Pratyay360/probot-go"
+```
+
+---
+
+## WebhookEvent Struct
+
+```go
+type WebhookEvent struct {
+    Name    string
+    ID      string
+    Payload map[string]any
+}
+```
+
+`WebhookEvent` is the internal representation of a single GitHub webhook
+delivery. It is created by `WebhookHandler` from the incoming HTTP request and
+then passed to `Receive`, which fans it out to matching handlers. You can also
+construct a `WebhookEvent` directly when writing tests or when running in
+GitHub Actions mode via `RunAction`.
+
+<ResponseField name="Name" type="string">
+  The webhook event name, taken from the `X-GitHub-Event` request header.
+  Examples: `"issues"`, `"push"`, `"pull_request"`, `"check_run"`.
+</ResponseField>
+
+<ResponseField name="ID" type="string">
+  The unique delivery ID assigned by GitHub, taken from the
+  `X-GitHub-Delivery` request header. Used for logging and deduplication.
+  Falls back to `"unknown"` when the header is absent, or to `GITHUB_RUN_ID`
+  when running as a GitHub Action.
+</ResponseField>
+
+<ResponseField name="Payload" type="map[string]any">
+  The parsed JSON body of the webhook request. Keys match the GitHub webhook
+  payload schema. Pass to `ctx.Payload()` or use `ctx.ParseInto` to decode
+  into a typed struct.
+</ResponseField>
+
+```go
+// Manually constructing a WebhookEvent for unit tests:
+event := probot.WebhookEvent{
+    Name: "issues",
+    ID:   "test-delivery-42",
+    Payload: map[string]any{
+        "action": "opened",
+        "issue":  map[string]any{"number": float64(1)},
+        "repository": map[string]any{
+            "name":  "my-repo",
+            "owner": map[string]any{"login": "acme"},
+        },
+        "installation": map[string]any{"id": float64(9876)},
+    },
+}
+err := app.Receive(event)
+```
+
+---
+
+## Signature Verification
+
+### `VerifyGitHubSignature`
+
+```go
+func VerifyGitHubSignature(secret, payload, signature string) error
+```
+
+Verifies the `X-Hub-Signature-256` header value against the raw request body
+using the configured webhook secret. Implements the algorithm documented in the
+[GitHub webhook docs](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries):
+HMAC-SHA256 over the raw body, hex-encoded, with a `sha256=` prefix.
+
+<ParamField path="secret" type="string" required>
+  The webhook secret configured in your GitHub App settings and in
+  `Options.Secret`.
+</ParamField>
+
+<ParamField path="payload" type="string" required>
+  The raw, unmodified request body as a string. Signature verification must be
+  done against the raw bytes before any JSON parsing.
+</ParamField>
+
+<ParamField path="signature" type="string" required>
+  The value of the `X-Hub-Signature-256` header, e.g.
+  `"sha256=abc123..."`.
+</ParamField>
+
+**Returns** `nil` on success. Returns a descriptive error in the following
+cases:
+
+| Condition | Error message |
+|---|---|
+| `signature` is empty | `probot: missing X-Hub-Signature-256 header` |
+| `signature` does not start with `sha256=` | `probot: unsupported signature format` |
+| HMAC does not match | `probot: signature mismatch` |
+
+The comparison is performed with `hmac.Equal` from the standard library, which
+runs in constant time to prevent timing-side-channel attacks.
+
+<Warning>
+  Always verify the signature before parsing or acting on the payload. Skipping
+  signature verification allows arbitrary actors to inject fake webhook events
+  into your application.
+</Warning>
+
+```go
+// Standalone usage (e.g. in your own handler):
+body, _ := io.ReadAll(r.Body)
+sig := r.Header.Get("X-Hub-Signature-256")
+
+if err := probot.VerifyGitHubSignature(secret, string(body), sig); err != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+}
+```
+
+---
+
+## HTTP Handlers on Probot
+
+### `WebhookHandler`
+
+```go
+func (p *Probot) WebhookHandler() http.HandlerFunc
+```
+
+Returns a `http.HandlerFunc` that implements the full webhook receive pipeline:
+
+1. **Method guard** — rejects any request that is not `POST` with `405 Method Not Allowed`.
+2. **Header extraction** — reads `X-GitHub-Event` (required), `X-GitHub-Delivery` (defaults to `"unknown"` if absent), and `X-Hub-Signature-256`.
+3. **Body reading** — reads the entire request body.
+4. **Signature verification** — calls `VerifyGitHubSignature` with `Options.Secret`. Returns `401 Unauthorized` on failure.
+5. **JSON parsing** — decodes the body into `map[string]any`. Returns `400 Bad Request` on failure.
+6. **Dispatch** — calls `Receive` with the resulting `WebhookEvent`.
+7. **Response** — writes `200 OK` with body `"OK"` on success; handler errors are logged but do not change the HTTP response code.
+
+```go
+mux := http.NewServeMux()
+mux.Handle("/api/github/webhooks", app.WebhookHandler())
+http.ListenAndServe(":3000", mux)
+```
+
+<CodeGroup>
+```text HTTP 200 — Success
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+OK
+```
+
+```text HTTP 401 — Bad Signature
+HTTP/1.1 401 Unauthorized
+Content-Type: text/plain
+
+invalid signature
+```
+
+```text HTTP 405 — Wrong Method
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain
+
+method not allowed
+```
+</CodeGroup>
+
+---
+
+### `WebhookMiddleware`
+
+```go
+func (p *Probot) WebhookMiddleware() func(http.Handler) http.Handler
+```
+
+Returns a standard net/http middleware function. When a request's URL path
+exactly matches `Options.WebhookPath`, the webhook handler runs and the wrapped
+`next` handler is **not** called. All other requests are forwarded to `next`
+unchanged.
+
+This is the Go equivalent of probot's `getNodeMiddleware()` and works with any
+router or middleware stack that accepts `func(http.Handler) http.Handler`.
+
+<ParamField path="(return value)" type="func(http.Handler) http.Handler">
+  A middleware function. Pass it to your router's `Use` method or wrap a
+  handler manually.
+</ParamField>
+
+```go
+// With chi:
+r := chi.NewRouter()
+r.Use(app.WebhookMiddleware())
+r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprint(w, "Hello!")
+})
+http.ListenAndServe(":3000", r)
+
+// Manual wrapping:
+base := http.NewServeMux()
+base.HandleFunc("/", homeHandler)
+http.ListenAndServe(":3000", app.WebhookMiddleware()(base))
+```
+
+---
+
+### `Handler`
+
+```go
+func (p *Probot) Handler(next ...http.Handler) http.Handler
+```
+
+Returns a minimal `http.Handler` that routes webhook requests and optionally
+delegates everything else to a fallback handler. Requests whose path equals
+`Options.WebhookPath` are handled by the webhook pipeline; all other requests
+are forwarded to `next[0]` if provided, or answered with `404 Not Found`
+otherwise.
+
+<ParamField path="next" type="...http.Handler">
+  Optional fallback handler for non-webhook requests. Only the first value is
+  used. Omit or pass `nil` to serve `404` for all other paths.
+</ParamField>
+
+```go
+// No fallback — 404 for everything except the webhook path:
+http.ListenAndServe(":3000", app.Handler())
+
+// With a custom fallback mux:
+api := http.NewServeMux()
+api.HandleFunc("/health", healthCheck)
+http.ListenAndServe(":3000", app.Handler(api))
+```
+
+<Tip>
+  For full setups including the setup wizard and manifest callback routes, use
+  `Server` and `NewServer` instead of composing handlers manually. See the
+  [Server reference](/api/server) for details.
+</Tip>
